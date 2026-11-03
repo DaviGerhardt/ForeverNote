@@ -605,13 +605,17 @@ async function cloudInit() {
       refreshSyncUI();
     });
     if (CLOUD.user) cloudOnLogin();
+    /* ao voltar pro app, busca as novidades na hora (sem esperar o poll) */
+    document.addEventListener("visibilitychange", () => { if (!document.hidden && CLOUD.user) cloudPullChanges(); });
+    addEventListener("focus", () => { if (CLOUD.user) cloudPullChanges(); });
+    addEventListener("online", () => { if (CLOUD.user) cloudPullChanges(); });
   } catch (e) { console.warn("cloudInit", e); }
   refreshSyncUI();
 }
 async function cloudSignUp(email, pass) { return SB.auth.signUp({ email: (email || "").trim(), password: pass }); }
 async function cloudSignIn(email, pass) { return SB.auth.signInWithPassword({ email: (email || "").trim(), password: pass }); }
 async function cloudSignOut() { try { if (CLOUD.sub) { SB.removeChannel(CLOUD.sub); CLOUD.sub = null; } await SB.auth.signOut(); } catch (e) {} }
-function cloudOnLogout() { CLOUD.state = "off"; if (CLOUD.sub) { try { SB.removeChannel(CLOUD.sub); } catch (e) {} CLOUD.sub = null; } refreshSyncUI(); }
+function cloudOnLogout() { CLOUD.state = "off"; cloudStopPoll(); if (CLOUD.sub) { try { SB.removeChannel(CLOUD.sub); } catch (e) {} CLOUD.sub = null; } refreshSyncUI(); }
 
 async function cloudOnLogin() {
   if (!SB || !CLOUD.user) return;
@@ -637,11 +641,39 @@ async function cloudOnLogin() {
     S.notes.forEach((n) => { const r = remote.get(n.id); if (!r || (n.updated || 0) > (r.updated || 0)) push.push(n); });
     if (push.length) await cloudPushNotes(push);
     if (!rnb || localNbUpd >= (rnb.updated || 0)) await cloudPushNotebooks();
-    saveLocalAll(); renderAll(true); cloudSubscribe();
+    let maxU = 0; rnotes.forEach((r) => { if ((r.updated || 0) > maxU) maxU = r.updated; });
+    CLOUD.lastPull = Math.max(maxU, rnb ? (rnb.updated || 0) : 0);
+    saveLocalAll(); renderAll(true); cloudSubscribe(); cloudStartPoll();
     CLOUD.state = "ok";
   } catch (e) { console.warn("cloudOnLogin", e); CLOUD.state = "err"; }
   refreshSyncUI();
 }
+/* busca incremental: só o que mudou desde a última vez (barato) */
+async function cloudPullChanges() {
+  if (!SB || !CLOUD.user) return;
+  try {
+    const since = Math.max(0, (CLOUD.lastPull || 0) - 10000);
+    const [nr, br] = await Promise.all([
+      SB.from("notes").select("id,data,updated,deleted").gt("updated", since),
+      SB.from("notebooks").select("list,updated").gt("updated", (S.nbUpdated || 0)).maybeSingle()
+    ]);
+    if (nr.error) return;
+    let changed = false, maxU = CLOUD.lastPull || 0;
+    (nr.data || []).forEach((r) => {
+      if ((r.updated || 0) > maxU) maxU = r.updated;
+      if (ED && ED.id === r.id) return;
+      const loc = S.notes.get(r.id);
+      if (r.deleted) { if (loc) { S.notes.delete(r.id); changed = true; } return; }
+      if (!loc || (r.updated || 0) > (loc.updated || 0)) { const n = { ...r.data, id: r.id }; n.tags = n.tags || []; S.notes.set(r.id, n); changed = true; }
+    });
+    CLOUD.lastPull = maxU;
+    if (br.data && Array.isArray(br.data.list) && (br.data.updated || 0) > (S.nbUpdated || 0)) { S.nbs = new Map(br.data.list.map((nb) => [nb.id, nb])); S.nbUpdated = br.data.updated; changed = true; }
+    if (changed) afterRemote();
+  } catch (e) {}
+}
+let pollTimer = null;
+function cloudStartPoll() { cloudStopPoll(); pollTimer = setInterval(() => { if (!document.hidden && CLOUD.user) cloudPullChanges(); }, 6000); }
+function cloudStopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 async function cloudPushNotes(notes) {
   if (!SB || !CLOUD.user || !notes.length) return;
   const rows = notes.map((n) => ({ id: n.id, user_id: CLOUD.user.id, data: n, updated: n.updated || Date.now(), deleted: false }));
@@ -673,11 +705,13 @@ function cloudSync(ids, dels, nb) {
     refreshSyncUI();
   })();
 }
-function cloudSubscribe() {
+async function cloudSubscribe() {
   if (!SB || !CLOUD.user || CLOUD.sub) return;
+  try { const { data } = await SB.auth.getSession(); if (data && data.session && SB.realtime && SB.realtime.setAuth) SB.realtime.setAuth(data.session.access_token); } catch (e) {}
   CLOUD.sub = SB.channel("fn-sync")
     .on("postgres_changes", { event: "*", schema: "public", table: "notes" }, (p) => {
       const r = p.new && p.new.id ? p.new : p.old; if (!r || !r.id) return;
+      if ((r.updated || 0) > (CLOUD.lastPull || 0)) CLOUD.lastPull = r.updated;
       if (ED && ED.id === r.id) return;
       const loc = S.notes.get(r.id);
       if (p.eventType === "DELETE" || r.deleted) { if (loc) { S.notes.delete(r.id); afterRemote(); } return; }
