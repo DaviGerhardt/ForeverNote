@@ -384,10 +384,20 @@ function fetchJSON(url) {
   });
 }
 const UPDATE_BRANCH = "main";
-const LATEST_URL = `https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDATE_BRANCH}/latest.json`;
+const API_LATEST = `https://api.github.com/repos/${UPDATE_REPO}/contents/latest.json?ref=${UPDATE_BRANCH}`;
+const RAW_LATEST = `https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDATE_BRANCH}/latest.json`;
 const CODE_ZIP_URL = `https://codeload.github.com/${UPDATE_REPO}/zip/refs/heads/${UPDATE_BRANCH}`;
+async function readLatest() {
+  /* a API reflete a última versão na hora; o raw é reserva caso a API falhe */
+  try {
+    const r = await fetchJSON(API_LATEST + "&t=" + Date.now());
+    if (r && r.content) return JSON.parse(Buffer.from(r.content, r.encoding || "base64").toString("utf8"));
+    if (r && r.version) return r;
+  } catch (e) {}
+  return await fetchJSON(RAW_LATEST + "?t=" + Date.now());
+}
 async function checkUpdate() {
-  const meta = await fetchJSON(LATEST_URL + "?t=" + Date.now());
+  const meta = await readLatest();
   const v = meta && meta.version;
   if (!v || !verGt(v, app.getVersion())) return null;
   return { version: String(v).replace(/^v/i, ""), notes: meta.notes || "" };
