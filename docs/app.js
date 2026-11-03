@@ -50,6 +50,7 @@ const api = window.api || (() => {
 const imgSrc = (name) => (/^(data|blob):/.test(name) ? name : "anexo://img/" + name);
 const WEB = !window.api;                               // true quando roda no navegador/celular
 const ICON = WEB ? "icon.png" : "../build/icon.png";
+if (WEB) try { document.documentElement.classList.add("web"); } catch (e) {}
 
 /* =========================================================
    Estado
@@ -2317,7 +2318,7 @@ function sortPop(btn) {
 function settingsModal(tab) {
   const P = S.prefs;
   let cur = tab || "geral", meterStop = null;
-  const TABS = [["geral", "folder", "Geral"], ["aparencia", "palette", "Aparência"], ["editor", "type", "Editor"], ["voz", "mic", "Microfone e voz"], ["atalhos", "keyboard", "Atalhos"]];
+  const TABS = [["geral", "folder", "Geral"], ["aparencia", "palette", "Aparência"], ["editor", "type", "Editor"], ...(WEB ? [] : [["voz", "mic", "Microfone e voz"], ["atalhos", "keyboard", "Atalhos"]])];
   const sw = (k, label, sub) => `<div class="set-row"><div class="sl"><b>${label}</b><span>${sub}</span></div><button class="switch${P[k] ? " on" : ""}" data-sw="${k}" role="switch" aria-checked="${!!P[k]}" aria-label="${label}"></button></div>`;
   const pane = {
     geral: () => `<div class="set-card pad about-card"><div class="about"><img src="${ICON}" alt=""><div><b>ForeverNote</b><br><span>by revmpt · ${WEB ? "versão celular" : "versão " + esc(appVer())}</span></div>${WEB ? "" : `<button class="btn" id="sUpd">${ic("restore")}Procurar atualizações</button>`}</div><div id="sUpdInfo" class="upd-info" hidden></div></div><h3>Geral</h3>
@@ -2331,14 +2332,14 @@ function settingsModal(tab) {
       <div class="set-card pad"><div style="display:flex;align-items:center;gap:12px"><span class="ev-logo">${ic("restore")}</span><div style="flex:1"><b>Importar do Evernote</b><p style="font-size:12.5px;color:var(--muted);margin:2px 0 0">Traz cadernos, notas, etiquetas, imagens e anexos, mantendo as datas de criação e edição.</p></div><button class="btn primary" id="sEnex">Importar…</button></div></div>
       <div class="set-card pad"><b>Cópias de segurança</b><p style="font-size:12.5px;color:var(--muted);margin:0">Todo dia o app guarda uma cópia de todas as suas notas, cadernos, imagens e áudios. As cópias dos últimos 14 dias ficam disponíveis, e notas excluídas da lixeira podem ser recuperadas por 14 dias. Suas notas em si nunca são apagadas.</p><div class="opts"><button class="btn primary" id="sRestore">${ic("restore")}Restaurar…</button><button class="btn" id="sBackups">${ic("folder")}Abrir pasta das cópias</button></div></div>`}`,
     aparencia: () => `<h3>Aparência</h3>
-      <div class="set-card"><div class="set-row"><div class="sl"><b>Tema</b><span>Claro, escuro ou igual ao Windows</span></div><div class="seg" id="sTheme">${[["system", "Sistema"], ["light", "Claro"], ["dark", "Escuro"]].map(([v, l]) => `<button data-theme="${v}" class="${P.theme === v ? "on" : ""}">${l}</button>`).join("")}</div></div>
+      <div class="set-card"><div class="set-row"><div class="sl"><b>Tema</b><span>Claro, escuro ou igual ao ${WEB ? "sistema" : "Windows"}</span></div><div class="seg" id="sTheme">${[["system", "Sistema"], ["light", "Claro"], ["dark", "Escuro"]].map(([v, l]) => `<button data-theme="${v}" class="${P.theme === v ? "on" : ""}">${l}</button>`).join("")}</div></div>
       ${sw("anim", "Animações", "Transições suaves ao abrir notas, menus e janelas.")}
       ${sw("wide", "Texto em largura total", "Usa toda a largura da tela para o texto das notas.")}</div>`,
     editor: () => `<h3>Editor</h3>
       <div class="set-card"><div class="set-row"><div class="sl"><b>Fonte padrão das notas</b><span>Usada no texto sem fonte escolhida</span></div><select class="field" id="sFont" style="width:180px">${FONTS.map(([k, l, st]) => `<option value="${esc(k === "fn-sans" ? "" : st)}"${(P.font || "") === (k === "fn-sans" ? "" : st) ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>
       <div class="set-row"><div class="sl"><b>Tamanho padrão</b><span>Tamanho da letra do texto da nota</span></div><select class="field" id="sSize" style="width:90px">${[13, 14, 15, 16, 17, 18, 20].map((x) => `<option${(P.size || 16) === x ? " selected" : ""}>${x}</option>`).join("")}</select></div>
       <div class="set-row"><div class="sl"><b>Ritmo de fala</b><span>Usado no tempo estimado que aparece no rodapé da nota</span></div><div class="seg" id="sWpm">${PACES.map(([v, l]) => `<button data-wpm="${v}" class="${(P.wpm || 150) === v ? "on" : ""}" title="${v} palavras por minuto">${l}</button>`).join("")}</div></div>
-      ${sw("spell", "Correção ortográfica", "Sublinha palavras erradas. Botão direito mostra sugestões.")}
+      ${sw("spell", "Correção ortográfica", WEB ? "Sublinha palavras erradas enquanto você escreve." : "Sublinha palavras erradas. Botão direito mostra sugestões.")}
       ${sw("autocap", "Maiúscula automática", "Começa frases com letra maiúscula.")}
       ${sw("autolink", "Links automáticos", "Transforma www.site.com em link clicável.")}
       ${sw("hints", "Dica na linha vazia", "Mostra “Digite / para comandos ou @ para vincular uma nota”.")}
@@ -2593,7 +2594,7 @@ function trigItems() {
   const q = norm(TRIG.q.replace(/ /g, " ")).trim();
   if (TRIG.kind === "/") {
     const out = []; let sec = null;
-    SLASH.forEach((it) => { if (it.sec) { sec = it.sec; return; } if (!q || norm(it.label + " " + (it.kw || "")).includes(q)) out.push({ ...it, secName: sec }); });
+    SLASH.forEach((it) => { if (it.sec) { sec = it.sec; return; } if (WEB && it.id === "mic") return; if (!q || norm(it.label + " " + (it.kw || "")).includes(q)) out.push({ ...it, secName: sec }); });
     return out;
   }
   const notes = [...S.notes.values()].filter((n) => !n.trashed && n.id !== (ED && ED.id)).filter((n) => !q || norm(titleOf(n) + " " + nbName(n.nb)).includes(q))

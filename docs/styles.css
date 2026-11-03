@@ -1058,3 +1058,22 @@ html.no-anim *,html.no-anim *::before,html.no-anim *::after{animation-duration:.
   .app.tplmode .tv.has-side{grid-template-columns:1fr 0px}
 }
 .no-anim .editor-pane{transition:none}
+
+/* =========================================================
+   Correções mobile v2: configurações, modelos, voz no web
+   ========================================================= */
+/* gravação/transcrição não existem no app web */
+html.web [data-cmd="mic"]{display:none}
+@media (max-width:640px){
+  /* linhas de configuração com seletor/segmento empilham (evita texto na vertical) */
+  .set-row:has(.seg),.set-row:has(select.field){flex-direction:column;align-items:stretch;gap:9px}
+  .set-row:has(.seg) .sl,.set-row:has(select.field) .sl{min-width:0}
+  .set-row:has(.seg) .seg,.set-row:has(select.field) select.field{width:100%}
+  .set-row:has(select.field) select.field{max-width:none}
+  .set-row .seg button{flex:1}
+  .set-row kbd{align-self:flex-start}
+  /* aba Modelos: botão "Novo modelo" acompanha a tela */
+  .tv-head{flex-wrap:wrap;align-items:center}
+  .tv-head .btn.primary{width:100%;justify-content:center;margin-top:2px;order:3}
+  .tv-h{flex:1 1 100%}
+}
