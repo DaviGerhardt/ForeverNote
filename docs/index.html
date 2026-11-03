@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob: anexo: https:; media-src 'self' blob: anexo:; connect-src 'self' anexo: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob: anexo: https:; media-src 'self' blob: anexo:; connect-src 'self' anexo: blob: https://dltfppkltlbyfrescrrh.supabase.co wss://dltfppkltlbyfrescrrh.supabase.co; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>ForeverNote</title>
 <meta name="theme-color" content="#14161a">
@@ -166,6 +166,7 @@
 </div>
 <div id="layer"></div>
 <input type="file" id="imgInput" accept="image/*" multiple hidden>
+<script src="supabase.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
