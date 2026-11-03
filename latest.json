@@ -1,4 +1,4 @@
 {
-  "version": "2.4.0",
-  "notes": "Atualização silenciosa: sem aquela janela preta (cmd) aparecendo\nO app agora reabre sozinho e independente ao atualizar\nMais estável no fechar e reabrir"
+  "version": "2.5.0",
+  "notes": "Atualização silenciosa de verdade — sem janela preta nenhuma\nAviso ao abrir confirmando a nova versão\nPequenos ajustes de estabilidade"
 }

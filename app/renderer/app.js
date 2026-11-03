@@ -3395,6 +3395,10 @@ async function init() {
   setTimeout(() => $("#app").classList.remove("booting"), 1100);
   setSave("ok");
   checkReminders(); setInterval(checkReminders, 20000);
+  /* aviso ao abrir logo após uma atualização (não em instalação nova) */
+  const curVer = appVer();
+  if (!d.firstRun && S.prefs.lastVer !== curVer) setTimeout(() => toast("✨ Atualizado para a versão " + curVer), 1400);
+  if (S.prefs.lastVer !== curVer) { S.prefs.lastVer = curVer; savePrefs(); }
   setTimeout(() => cleanAttachments(864e5), 8000);
   setInterval(() => { updateStamp(false); if (!ED || document.activeElement?.id === "tagIn" || $(".suggest")) return; renderFoot(); }, 60000);
   if ("Notification" in window && Notification.permission === "default") try { Notification.requestPermission(); } catch (e) {}
