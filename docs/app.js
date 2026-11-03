@@ -755,34 +755,85 @@ function cloudErrMsg(e) {
   if (m.includes("network") || m.includes("fetch")) return "Sem conexão com a nuvem agora. Tente de novo.";
   return "Não consegui agora. Tente de novo.";
 }
+async function doAuth(mode, email, pass) {
+  try {
+    const r = mode === "in" ? await cloudSignIn(email, pass) : await cloudSignUp(email, pass);
+    if (r.error) return { error: cloudErrMsg(r.error) };
+    if (mode === "up" && r.data && !r.data.session) return { needConfirm: true };
+    return { ok: true };
+  } catch (e) { return { error: cloudErrMsg(e) }; }
+}
+function authFormHTML(p) {
+  return `<form class="auth-form" id="${p}F" novalidate>
+    <label class="lg-l">E-mail<input class="field" type="email" id="${p}E" autocomplete="email" inputmode="email" required placeholder="voce@email.com"></label>
+    <label class="lg-l">Senha<div class="pw-wrap"><input class="field" type="password" id="${p}P" autocomplete="current-password" minlength="6" required placeholder="mínimo 6 caracteres"><button type="button" class="pw-eye" data-eye="${p}P" aria-label="Mostrar senha">${ic("eye")}</button></div></label>
+    <div id="${p}Msg" class="lg-msg" hidden></div>
+    <button class="btn primary" type="submit" id="${p}Go">Entrar</button>
+    <button type="button" class="lg-switch" id="${p}Sw">Não tem conta? Criar uma</button>
+  </form>`;
+}
+function wireAuthForm(root, p, onSuccess, startMode) {
+  let mode = "in";
+  const g = (s) => $("#" + p + s, root);
+  const setMode = (mm) => {
+    mode = mm;
+    g("Go").textContent = mode === "in" ? "Entrar" : "Criar conta";
+    g("Sw").textContent = mode === "in" ? "Não tem conta? Criar uma" : "Já tem conta? Entrar";
+    g("P").setAttribute("autocomplete", mode === "in" ? "current-password" : "new-password");
+    const h = root.querySelector("[data-authtitle]"); if (h) h.textContent = mode === "in" ? "Entrar" : "Criar conta";
+  };
+  root.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-eye]"); if (!b) return;
+    const inp = $("#" + b.dataset.eye, root); if (!inp) return;
+    const show = inp.type === "password"; inp.type = show ? "text" : "password";
+    b.innerHTML = ic(show ? "eye-off" : "eye"); b.setAttribute("aria-label", show ? "Esconder senha" : "Mostrar senha");
+  });
+  g("Sw").onclick = () => { g("Msg").hidden = true; setMode(mode === "in" ? "up" : "in"); g("E").focus(); };
+  g("F").onsubmit = async (e) => {
+    e.preventDefault();
+    const email = g("E").value.trim(), pass = g("P").value;
+    const msg = g("Msg"); msg.hidden = true; msg.className = "lg-msg";
+    if (!email || pass.length < 6) { msg.hidden = false; msg.textContent = "Preencha o e-mail e uma senha de 6+ letras."; return; }
+    const btn = g("Go"); btn.disabled = true; const old = btn.textContent; btn.textContent = "Aguarde…";
+    const r = await doAuth(mode, email, pass);
+    if (r.ok) { onSuccess(); return; }
+    btn.disabled = false; btn.textContent = old;
+    msg.hidden = false;
+    if (r.needConfirm) { msg.className = "lg-msg ok"; msg.textContent = "Conta criada! Agora é só entrar."; setMode("in"); }
+    else msg.textContent = r.error;
+  };
+  if (startMode) setMode(startMode);
+}
 function loginModal() {
   if (!SB) return;
-  let mode = "in";
-  const m = modal(`<div class="m-head"><div class="m-ic">${ic("restore")}</div><h2 id="lgT">Entrar</h2><button class="ib" id="lgX" aria-label="Fechar">${ic("x")}</button></div>
-    <form class="m-body lg-body" id="lgF">
-      <p class="sync-p">Use o mesmo e-mail e senha no PC e no celular pra sincronizar. Se é sua primeira vez, crie uma conta.</p>
-      <label class="lg-l">E-mail<input class="field" type="email" id="lgE" autocomplete="email" required></label>
-      <label class="lg-l">Senha<input class="field" type="password" id="lgP" autocomplete="current-password" minlength="6" required placeholder="mínimo 6 caracteres"></label>
-      <div id="lgMsg" class="lg-msg" hidden></div>
-      <button class="btn primary" type="submit" id="lgGo">Entrar</button>
-      <button type="button" class="lg-switch" id="lgSw">Não tem conta? Criar uma</button>
-    </form>`);
-  const setMode = (mm) => { mode = mm; $("#lgT", m).textContent = mode === "in" ? "Entrar" : "Criar conta"; $("#lgGo", m).textContent = mode === "in" ? "Entrar" : "Criar conta"; $("#lgSw", m).textContent = mode === "in" ? "Não tem conta? Criar uma" : "Já tem conta? Entrar"; $("#lgP", m).setAttribute("autocomplete", mode === "in" ? "current-password" : "new-password"); };
+  const m = modal(`<div class="m-head"><div class="m-ic">${ic("restore")}</div><h2 data-authtitle>Entrar</h2><button class="ib" id="lgX" aria-label="Fechar">${ic("x")}</button></div>
+    <div class="m-body lg-body"><p class="sync-p">Use o mesmo e-mail e senha no PC e no celular pra sincronizar.</p>${authFormHTML("lg")}</div>`);
   $("#lgX", m).onclick = () => m.close();
-  $("#lgSw", m).onclick = () => { const msg = $("#lgMsg", m); msg.hidden = true; setMode(mode === "in" ? "up" : "in"); };
-  $("#lgF", m).onsubmit = async (e) => {
-    e.preventDefault();
-    const email = $("#lgE", m).value, pass = $("#lgP", m).value;
-    const msg = $("#lgMsg", m); msg.hidden = true; msg.className = "lg-msg";
-    const btn = $("#lgGo", m); btn.disabled = true; const old = btn.textContent; btn.textContent = "Aguarde…";
-    try {
-      const r = mode === "in" ? await cloudSignIn(email, pass) : await cloudSignUp(email, pass);
-      if (r.error) throw r.error;
-      if (mode === "up" && r.data && !r.data.session) { msg.hidden = false; msg.className = "lg-msg ok"; msg.textContent = "Conta criada! Agora é só entrar."; setMode("in"); btn.disabled = false; btn.textContent = "Entrar"; return; }
-      m.close(); toast("Sincronização ligada ✨");
-    } catch (er) { msg.hidden = false; msg.textContent = cloudErrMsg(er); btn.disabled = false; btn.textContent = old; }
-  };
+  wireAuthForm(m, "lg", () => { m.close(); toast("Sincronização ligada ✨"); });
   setTimeout(() => $("#lgE", m) && $("#lgE", m).focus(), 60);
+}
+function welcomeScreen() {
+  if (!SB || $("#welcome")) return;
+  const w = document.createElement("div");
+  w.id = "welcome"; w.className = "welcome";
+  w.innerHTML = `<div class="welcome-card">
+      <div class="welcome-logo"><img src="${ICON}" alt=""></div>
+      <h1 data-authtitle>Criar conta</h1>
+      <p class="welcome-sub">Bem-vindo ao ForeverNote! Crie sua conta pra suas notas, roteiros e tarefas ficarem iguais no PC e no celular.</p>
+      ${authFormHTML("wl")}
+      <button type="button" class="welcome-skip" id="wlSkip">Usar sem conta por enquanto</button>
+    </div>`;
+  document.body.appendChild(w);
+  const done = () => { try { localStorage.setItem("fn-welcomed", "1"); } catch (e) {} w.classList.add("out"); setTimeout(() => w.remove(), 360); };
+  wireAuthForm(w, "wl", () => { done(); toast("Sincronização ligada ✨"); }, "up");
+  $("#wlSkip", w).onclick = done;
+  requestAnimationFrame(() => w.classList.add("show"));
+  setTimeout(() => { const e = $("#wlE", w); if (e && !matchMedia("(max-width:640px)").matches) e.focus(); }, 450);
+}
+function maybeWelcome() {
+  if (!WEB || !SB || CLOUD.user) return;
+  let seen = true; try { seen = localStorage.getItem("fn-welcomed") === "1"; } catch (e) {}
+  if (!seen) welcomeScreen();
 }
 
 /* =========================================================
@@ -3615,7 +3666,7 @@ async function init() {
   renderSidebar(); renderList(true); renderTabs(); renderPane();
   applyMobile();
   if (WEB && "serviceWorker" in navigator) { try { navigator.serviceWorker.register("sw.js"); } catch (e) {} }
-  cloudInit();
+  await cloudInit(); maybeWelcome();
   setTimeout(() => $("#app").classList.remove("booting"), 1100);
   setSave("ok");
   checkReminders(); setInterval(checkReminders, 20000);
