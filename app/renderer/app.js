@@ -1971,7 +1971,7 @@ function modal(html, o = {}) {
   const close = () => { if (sc.classList.contains("closing")) return; sc.classList.add("closing"); setTimeout(() => sc.remove(), 160); o.onClose && o.onClose(); };
   sc.addEventListener("mousedown", (e) => { if (e.target === sc) close(); });
   sc.close = close;
-  setTimeout(() => (sc.querySelector("[autofocus]") || sc.querySelector("input,button.primary") || sc.querySelector(".modal"))?.focus(), 40);
+  setTimeout(() => (sc.querySelector("[autofocus]") || sc.querySelector("input,button.primary") || sc.querySelector(".modal"))?.focus({ preventScroll: true }), 40);
   return sc;
 }
 function ask({ title, text, ok = "OK", cancel = "Cancelar", danger, icon = "notes", input, value = "", extra = "" }) {

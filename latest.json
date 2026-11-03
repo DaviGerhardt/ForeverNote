@@ -1,4 +1,4 @@
 {
   "version": "2.3.0",
-  "notes": "Atualização de teste\nConfirma que o ForeverNote se atualiza sozinho pelo GitHub.\nSe você está lendo isto, o mecanismo funcionou!"
+  "notes": "Configurações agora abre no topo, em vez de já rolada\nDetecção de atualização instantânea, sem esperar cache\nAjustes internos do atualizador"
 }
