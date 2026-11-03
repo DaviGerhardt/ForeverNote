@@ -440,11 +440,21 @@ ipcMain.handle("update:install", async (e, info) => {
     const destApp = app.getAppPath();              // <instalação>/resources/app
     const exe = process.execPath;                   // <instalação>/ForeverNote.exe
     const q = (s) => '"' + s + '"';
-    const batContent = `@echo off\r\nchcp 65001 >nul\r\ntaskkill /im "ForeverNote.exe" /f >nul 2>&1\r\ntimeout /t 2 /nobreak >nul\r\nrobocopy ${q(srcApp)} ${q(destApp)} /MIR /NFL /NDL /NJH /NJS /NP >nul\r\nstart "" ${q(exe)}\r\nrmdir /s /q ${q(dir)} >nul 2>&1\r\n`;
+    /* ping no lugar de timeout (funciona sem console); start desacopla o app; a janela roda escondida e o .bat se apaga no fim */
+    const batContent = [
+      "@echo off",
+      "chcp 65001 >nul",
+      'taskkill /im "ForeverNote.exe" /f >nul 2>&1',
+      "ping -n 3 127.0.0.1 >nul",
+      `robocopy ${q(srcApp)} ${q(destApp)} /MIR /NFL /NDL /NJH /NJS /NP >nul`,
+      `start "" ${q(exe)}`,
+      `rmdir /s /q ${q(dir)} >nul 2>&1`,
+      '(goto) 2>nul & del "%~f0"'
+    ].join("\r\n") + "\r\n";
     const bat = path.join(os.tmpdir(), "fn-update-" + Date.now() + ".bat");
     fs.writeFileSync(bat, batContent, "latin1");
     setTimeout(() => {
-      try { spawn("cmd.exe", ["/c", "start", "", "/min", bat], { detached: true, stdio: "ignore" }).unref(); } catch (er) {}
+      try { spawn("cmd.exe", ["/c", bat], { detached: true, stdio: "ignore", windowsHide: true }).unref(); } catch (er) {}
       app.isQuitting = true; app.quit();
     }, 400);
     return { ok: true };

@@ -1,4 +1,4 @@
 {
-  "version": "2.3.0",
-  "notes": "Configurações agora abre no topo, em vez de já rolada\nDetecção de atualização instantânea, sem esperar cache\nAjustes internos do atualizador"
+  "version": "2.4.0",
+  "notes": "Atualização silenciosa: sem aquela janela preta (cmd) aparecendo\nO app agora reabre sozinho e independente ao atualizar\nMais estável no fechar e reabrir"
 }
