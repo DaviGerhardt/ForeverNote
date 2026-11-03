@@ -661,10 +661,7 @@ async function cloudPullChanges() {
     let changed = false, maxU = CLOUD.lastPull || 0;
     (nr.data || []).forEach((r) => {
       if ((r.updated || 0) > maxU) maxU = r.updated;
-      if (ED && ED.id === r.id) return;
-      const loc = S.notes.get(r.id);
-      if (r.deleted) { if (loc) { S.notes.delete(r.id); changed = true; } return; }
-      if (!loc || (r.updated || 0) > (loc.updated || 0)) { const n = { ...r.data, id: r.id }; n.tags = n.tags || []; S.notes.set(r.id, n); changed = true; }
+      if (applyRemoteNote(r)) changed = true;
     });
     CLOUD.lastPull = maxU;
     if (br.data && Array.isArray(br.data.list) && (br.data.updated || 0) > (S.nbUpdated || 0)) { S.nbs = new Map(br.data.list.map((nb) => [nb.id, nb])); S.nbUpdated = br.data.updated; changed = true; }
@@ -672,7 +669,7 @@ async function cloudPullChanges() {
   } catch (e) {}
 }
 let pollTimer = null;
-function cloudStartPoll() { cloudStopPoll(); pollTimer = setInterval(() => { if (!document.hidden && CLOUD.user) cloudPullChanges(); }, 6000); }
+function cloudStartPoll() { cloudStopPoll(); pollTimer = setInterval(() => { if (!document.hidden && CLOUD.user) cloudPullChanges(); }, 4000); }
 function cloudStopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 async function cloudPushNotes(notes) {
   if (!SB || !CLOUD.user || !notes.length) return;
@@ -712,10 +709,8 @@ async function cloudSubscribe() {
     .on("postgres_changes", { event: "*", schema: "public", table: "notes" }, (p) => {
       const r = p.new && p.new.id ? p.new : p.old; if (!r || !r.id) return;
       if ((r.updated || 0) > (CLOUD.lastPull || 0)) CLOUD.lastPull = r.updated;
-      if (ED && ED.id === r.id) return;
-      const loc = S.notes.get(r.id);
-      if (p.eventType === "DELETE" || r.deleted) { if (loc) { S.notes.delete(r.id); afterRemote(); } return; }
-      if (!loc || (r.updated || 0) > (loc.updated || 0)) { const n = { ...r.data, id: r.id }; n.tags = n.tags || []; S.notes.set(r.id, n); afterRemote(); }
+      const rr = p.eventType === "DELETE" ? { id: r.id, deleted: true, updated: r.updated || Date.now() } : r;
+      if (applyRemoteNote(rr)) afterRemote();
     })
     .on("postgres_changes", { event: "*", schema: "public", table: "notebooks" }, (p) => {
       const r = p.new; if (!r || !Array.isArray(r.list)) return;
@@ -723,12 +718,33 @@ async function cloudSubscribe() {
     })
     .subscribe();
 }
+/* aplica uma nota vinda da nuvem; devolve true se mudou algo. Nunca atropela a nota que você está digitando. */
+let pendingOpenChanged = false;
+function editorBusy() {
+  try {
+    if (!ED) return false;
+    if (dirty.has(ED.id)) return true;
+    const a = document.activeElement;
+    return !!(a && ((ED.doc && ED.doc.contains(a)) || a === $("#title")));
+  } catch (e) { return false; }
+}
+function applyRemoteNote(r) {
+  if (!r || !r.id) return false;
+  const isOpen = ED && ED.id === r.id;
+  if (isOpen && editorBusy()) return false;
+  const loc = S.notes.get(r.id);
+  if (r.deleted) { if (loc) { S.notes.delete(r.id); if (isOpen) pendingOpenChanged = true; return true; } return false; }
+  if (!loc || (r.updated || 0) > (loc.updated || 0)) { const n = { ...r.data, id: r.id }; n.tags = n.tags || []; S.notes.set(r.id, n); if (isOpen) pendingOpenChanged = true; return true; }
+  return false;
+}
 let afterRemoteT = 0;
 function afterRemote() {
   saveLocalAll();
   clearTimeout(afterRemoteT);
   afterRemoteT = setTimeout(() => {
+    const oc = pendingOpenChanged; pendingOpenChanged = false;
     if (ED && !S.notes.has(ED.id)) { const i = S.tabs.indexOf(ED.id); if (i >= 0) S.tabs.splice(i, 1); S.active = S.tabs.find((t) => S.notes.has(t)) || null; renderTabs(); renderPane(); }
+    else if (oc && ED) { renderPane({ keepScroll: $("#edScroll") ? $("#edScroll").scrollTop : 0 }); }
     renderSidebar(); renderList(false, true);
   }, 150);
 }
