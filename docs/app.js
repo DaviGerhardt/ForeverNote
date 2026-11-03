@@ -739,9 +739,9 @@ function applyRemoteNote(r) {
 }
 let afterRemoteT = 0;
 function afterRemote() {
-  saveLocalAll();
   clearTimeout(afterRemoteT);
   afterRemoteT = setTimeout(() => {
+    saveLocalAll();
     const oc = pendingOpenChanged; pendingOpenChanged = false;
     if (ED && !S.notes.has(ED.id)) { const i = S.tabs.indexOf(ED.id); if (i >= 0) S.tabs.splice(i, 1); S.active = S.tabs.find((t) => S.notes.has(t)) || null; renderTabs(); renderPane(); }
     else if (oc && ED) { renderPane({ keepScroll: $("#edScroll") ? $("#edScroll").scrollTop : 0 }); }

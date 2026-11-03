@@ -44,10 +44,20 @@ const api = window.api || (() => {
     async setFullscreen(on) { try { on ? await document.documentElement.requestFullscreen() : await document.exitFullscreen(); } catch (e) {} return on; },
     async focus() {}, async exportNote() { return false; },
     flush(p) { const d = get(); d.notes = d.notes || {}; (p.notes || []).forEach((n) => (d.notes[n.id] = n)); (p.deleted || []).forEach((id) => delete d.notes[id]); if (p.notebooks) d.notebooks = p.notebooks; if (p.session) d.session = p.session; put(d); },
+    async replaceAll(a) { const d = get(); d.notes = {}; (a.notes || []).forEach((n) => (d.notes[n.id] = n)); d.notebooks = a.notebooks || []; put(d); },
     onFullscreen(cb) { document.addEventListener("fullscreenchange", () => cb(!!document.fullscreenElement)); }
   };
 })();
 const imgSrc = (name) => (/^(data|blob):/.test(name) ? name : "anexo://img/" + name);
+const WEB = !window.api;                               // true quando roda no navegador/celular
+const ICON = WEB ? "icon.png" : "../build/icon.png";
+if (WEB) try { document.documentElement.classList.add("web"); } catch (e) {}
+
+/* ---------- nuvem (Supabase): login + sincronização ---------- */
+const SUPA_URL = "https://dltfppkltlbyfrescrrh.supabase.co";
+const SUPA_KEY = "sb_publishable_aPoOIFs518bclT_KEwWm_g_6wtmzYFJ";
+const SB = (window.supabase && SUPA_URL) ? window.supabase.createClient(SUPA_URL, SUPA_KEY, { auth: { persistSession: true, autoRefreshToken: true, storageKey: "fn-auth" } }) : null;
+const CLOUD = { user: null, state: "off", sub: null };  // state: off | syncing | ok | err
 
 /* =========================================================
    Estado
@@ -60,7 +70,7 @@ const S = {
   tabs: [], active: null, hist: [], histPos: -1,
   expanded: false, fullscreen: false, closed: {}, scroll: {},
   prefs: { theme: "system", autocap: true, spell: true, autolink: true, font: "", size: 16, wide: false, zoom: 1, anim: true, micId: "", lang: "pt", afterRec: "ask", hints: true, proofOnline: null, myWords: [], closeToTray: true, minToTray: true, startLogin: false, wpm: 150, templates: [] },
-  dataDir: "", platform: "",
+  dataDir: "", platform: "", nbUpdated: 0,
   picked: new Set(), pickMode: false, lastPick: null
 };
 function blankFilter() { return { tags: [], prio: [], stage: [], created: "any", from: "", to: "", fav: false, reminder: false, img: false, link: false }; }
@@ -581,6 +591,268 @@ function mergeTplMeta(n, t) {
 }
 
 /* =========================================================
+   Nuvem: autenticação e sincronização (Supabase)
+   ========================================================= */
+async function cloudInit() {
+  if (!SB) return;
+  try {
+    const { data } = await SB.auth.getSession();
+    CLOUD.user = data && data.session ? data.session.user : null;
+    SB.auth.onAuthStateChange((_ev, session) => {
+      const had = !!CLOUD.user; CLOUD.user = session ? session.user : null;
+      if (CLOUD.user && !had) cloudOnLogin();
+      else if (!CLOUD.user && had) cloudOnLogout();
+      refreshSyncUI();
+    });
+    if (CLOUD.user) cloudOnLogin();
+    /* ao voltar pro app, busca as novidades na hora (sem esperar o poll) */
+    document.addEventListener("visibilitychange", () => { if (!document.hidden && CLOUD.user) cloudPullChanges(); });
+    addEventListener("focus", () => { if (CLOUD.user) cloudPullChanges(); });
+    addEventListener("online", () => { if (CLOUD.user) cloudPullChanges(); });
+  } catch (e) { console.warn("cloudInit", e); }
+  refreshSyncUI();
+}
+async function cloudSignUp(email, pass) { return SB.auth.signUp({ email: (email || "").trim(), password: pass }); }
+async function cloudSignIn(email, pass) { return SB.auth.signInWithPassword({ email: (email || "").trim(), password: pass }); }
+async function cloudSignOut() { try { if (CLOUD.sub) { SB.removeChannel(CLOUD.sub); CLOUD.sub = null; } await SB.auth.signOut(); } catch (e) {} }
+function cloudOnLogout() { CLOUD.state = "off"; cloudStopPoll(); if (CLOUD.sub) { try { SB.removeChannel(CLOUD.sub); } catch (e) {} CLOUD.sub = null; } refreshSyncUI(); }
+
+async function cloudOnLogin() {
+  if (!SB || !CLOUD.user) return;
+  CLOUD.state = "syncing"; refreshSyncUI();
+  try {
+    const [notesRes, nbRes] = await Promise.all([
+      SB.from("notes").select("id,data,updated,deleted"),
+      SB.from("notebooks").select("list,updated").maybeSingle()
+    ]);
+    if (notesRes.error) throw notesRes.error;
+    const rnotes = notesRes.data || [], rnb = nbRes.data;
+    const remote = new Map(rnotes.map((r) => [r.id, r]));
+    rnotes.forEach((r) => {
+      const loc = S.notes.get(r.id);
+      if (!loc || (r.updated || 0) > (loc.updated || 0)) {
+        if (r.deleted) S.notes.delete(r.id);
+        else { const n = { ...r.data, id: r.id }; n.tags = n.tags || []; S.notes.set(r.id, n); }
+      }
+    });
+    const localNbUpd = S.nbUpdated || 0;
+    if (rnb && Array.isArray(rnb.list) && (rnb.updated || 0) > localNbUpd) { S.nbs = new Map(rnb.list.map((nb) => [nb.id, nb])); S.nbUpdated = rnb.updated; }
+    const push = [];
+    S.notes.forEach((n) => { const r = remote.get(n.id); if (!r || (n.updated || 0) > (r.updated || 0)) push.push(n); });
+    if (push.length) await cloudPushNotes(push);
+    if (!rnb || localNbUpd >= (rnb.updated || 0)) await cloudPushNotebooks();
+    let maxU = 0; rnotes.forEach((r) => { if ((r.updated || 0) > maxU) maxU = r.updated; });
+    CLOUD.lastPull = Math.max(maxU, rnb ? (rnb.updated || 0) : 0);
+    saveLocalAll(); renderAll(true); cloudSubscribe(); cloudStartPoll();
+    CLOUD.state = "ok";
+  } catch (e) { console.warn("cloudOnLogin", e); CLOUD.state = "err"; }
+  refreshSyncUI();
+}
+/* busca incremental: só o que mudou desde a última vez (barato) */
+async function cloudPullChanges() {
+  if (!SB || !CLOUD.user) return;
+  try {
+    const since = Math.max(0, (CLOUD.lastPull || 0) - 10000);
+    const [nr, br] = await Promise.all([
+      SB.from("notes").select("id,data,updated,deleted").gt("updated", since),
+      SB.from("notebooks").select("list,updated").gt("updated", (S.nbUpdated || 0)).maybeSingle()
+    ]);
+    if (nr.error) return;
+    let changed = false, maxU = CLOUD.lastPull || 0;
+    (nr.data || []).forEach((r) => {
+      if ((r.updated || 0) > maxU) maxU = r.updated;
+      if (applyRemoteNote(r)) changed = true;
+    });
+    CLOUD.lastPull = maxU;
+    if (br.data && Array.isArray(br.data.list) && (br.data.updated || 0) > (S.nbUpdated || 0)) { S.nbs = new Map(br.data.list.map((nb) => [nb.id, nb])); S.nbUpdated = br.data.updated; changed = true; }
+    if (changed) afterRemote();
+  } catch (e) {}
+}
+let pollTimer = null;
+function cloudStartPoll() { cloudStopPoll(); pollTimer = setInterval(() => { if (!document.hidden && CLOUD.user) cloudPullChanges(); }, 4000); }
+function cloudStopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+async function cloudPushNotes(notes) {
+  if (!SB || !CLOUD.user || !notes.length) return;
+  const rows = notes.map((n) => ({ id: n.id, user_id: CLOUD.user.id, data: n, updated: n.updated || Date.now(), deleted: false }));
+  const { error } = await SB.from("notes").upsert(rows, { onConflict: "user_id,id" });
+  if (error) throw error;
+}
+async function cloudDeleteNotes(ids) {
+  if (!SB || !CLOUD.user || !ids.length) return;
+  const rows = ids.map((id) => ({ id, user_id: CLOUD.user.id, data: {}, updated: Date.now(), deleted: true }));
+  await SB.from("notes").upsert(rows, { onConflict: "user_id,id" });
+}
+async function cloudPushNotebooks() {
+  if (!SB || !CLOUD.user) return;
+  S.nbUpdated = Date.now();
+  const { error } = await SB.from("notebooks").upsert({ user_id: CLOUD.user.id, list: [...S.nbs.values()], updated: S.nbUpdated }, { onConflict: "user_id" });
+  if (error) throw error;
+}
+function cloudSync(ids, dels, nb) {
+  if (!SB || !CLOUD.user) return;
+  (async () => {
+    try {
+      CLOUD.state = "syncing"; refreshSyncUI();
+      const notes = ids.map((id) => S.notes.get(id)).filter(Boolean);
+      if (notes.length) await cloudPushNotes(notes);
+      if (dels && dels.length) await cloudDeleteNotes(dels);
+      if (nb) await cloudPushNotebooks();
+      CLOUD.state = "ok";
+    } catch (e) { console.warn("cloudSync", e); CLOUD.state = "err"; }
+    refreshSyncUI();
+  })();
+}
+async function cloudSubscribe() {
+  if (!SB || !CLOUD.user || CLOUD.sub) return;
+  try { const { data } = await SB.auth.getSession(); if (data && data.session && SB.realtime && SB.realtime.setAuth) SB.realtime.setAuth(data.session.access_token); } catch (e) {}
+  CLOUD.sub = SB.channel("fn-sync")
+    .on("postgres_changes", { event: "*", schema: "public", table: "notes" }, (p) => {
+      const r = p.new && p.new.id ? p.new : p.old; if (!r || !r.id) return;
+      if ((r.updated || 0) > (CLOUD.lastPull || 0)) CLOUD.lastPull = r.updated;
+      const rr = p.eventType === "DELETE" ? { id: r.id, deleted: true, updated: r.updated || Date.now() } : r;
+      if (applyRemoteNote(rr)) afterRemote();
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "notebooks" }, (p) => {
+      const r = p.new; if (!r || !Array.isArray(r.list)) return;
+      if ((r.updated || 0) > (S.nbUpdated || 0)) { S.nbs = new Map(r.list.map((nb) => [nb.id, nb])); S.nbUpdated = r.updated; afterRemote(); }
+    })
+    .subscribe();
+}
+/* aplica uma nota vinda da nuvem; devolve true se mudou algo. Nunca atropela a nota que você está digitando. */
+let pendingOpenChanged = false;
+function editorBusy() {
+  try {
+    if (!ED) return false;
+    if (dirty.has(ED.id)) return true;
+    const a = document.activeElement;
+    return !!(a && ((ED.doc && ED.doc.contains(a)) || a === $("#title")));
+  } catch (e) { return false; }
+}
+function applyRemoteNote(r) {
+  if (!r || !r.id) return false;
+  const isOpen = ED && ED.id === r.id;
+  if (isOpen && editorBusy()) return false;
+  const loc = S.notes.get(r.id);
+  if (r.deleted) { if (loc) { S.notes.delete(r.id); if (isOpen) pendingOpenChanged = true; return true; } return false; }
+  if (!loc || (r.updated || 0) > (loc.updated || 0)) { const n = { ...r.data, id: r.id }; n.tags = n.tags || []; S.notes.set(r.id, n); if (isOpen) pendingOpenChanged = true; return true; }
+  return false;
+}
+let afterRemoteT = 0;
+function afterRemote() {
+  clearTimeout(afterRemoteT);
+  afterRemoteT = setTimeout(() => {
+    saveLocalAll();
+    const oc = pendingOpenChanged; pendingOpenChanged = false;
+    if (ED && !S.notes.has(ED.id)) { const i = S.tabs.indexOf(ED.id); if (i >= 0) S.tabs.splice(i, 1); S.active = S.tabs.find((t) => S.notes.has(t)) || null; renderTabs(); renderPane(); }
+    else if (oc && ED) { renderPane({ keepScroll: $("#edScroll") ? $("#edScroll").scrollTop : 0 }); }
+    renderSidebar(); renderList(false, true);
+  }, 150);
+}
+function saveLocalAll() {
+  try {
+    if (api.replaceAll) api.replaceAll({ notes: [...S.notes.values()], notebooks: [...S.nbs.values()] });
+    else if (api.flush) api.flush({ notes: [...S.notes.values()], deleted: [], notebooks: [...S.nbs.values()], session: sessionData() });
+  } catch (e) {}
+}
+function refreshSyncUI() { const c = $("#syncCard"); if (c) c.outerHTML = syncCardHTML(); }
+function syncCardHTML() {
+  if (!SB) return `<div class="set-card pad" id="syncCard"><b>Sincronização</b><p class="sync-p">Indisponível nesta versão.</p></div>`;
+  const u = CLOUD.user;
+  const st = { off: "", syncing: "sincronizando…", ok: "tudo sincronizado", err: "erro ao sincronizar — tentando de novo" }[CLOUD.state] || "";
+  if (u) return `<div class="set-card pad" id="syncCard"><div class="sync-row"><span class="sync-dot ${CLOUD.state}"></span><div class="sync-info"><b>Sincronização ligada</b><span>Conta: ${esc(u.email || "você")}${st ? " · " + st : ""}</span></div><button class="btn" id="syncOut">Sair</button></div></div>`;
+  return `<div class="set-card pad" id="syncCard"><b>Sincronizar entre aparelhos</b><p class="sync-p">Entre com uma conta e suas notas aparecem no PC e no celular, sempre iguais. Cada conta tem suas próprias notas, separadas.</p><button class="btn primary" id="syncIn">${ic("restore")}Entrar / Criar conta</button></div>`;
+}
+function cloudErrMsg(e) {
+  const m = (e && e.message || "").toLowerCase();
+  if (m.includes("invalid login")) return "E-mail ou senha incorretos.";
+  if (m.includes("already registered") || m.includes("already been registered")) return "Esse e-mail já tem conta. Tente entrar.";
+  if (m.includes("password") && m.includes("6")) return "A senha precisa de pelo menos 6 caracteres.";
+  if (m.includes("confirm")) return "Confirme seu e-mail (ou peça para desligar a confirmação).";
+  if (m.includes("network") || m.includes("fetch")) return "Sem conexão com a nuvem agora. Tente de novo.";
+  return "Não consegui agora. Tente de novo.";
+}
+async function doAuth(mode, email, pass) {
+  try {
+    const r = mode === "in" ? await cloudSignIn(email, pass) : await cloudSignUp(email, pass);
+    if (r.error) return { error: cloudErrMsg(r.error) };
+    if (mode === "up" && r.data && !r.data.session) return { needConfirm: true };
+    return { ok: true };
+  } catch (e) { return { error: cloudErrMsg(e) }; }
+}
+function authFormHTML(p) {
+  return `<form class="auth-form" id="${p}F" novalidate>
+    <label class="lg-l">E-mail<input class="field" type="email" id="${p}E" autocomplete="email" inputmode="email" required placeholder="voce@email.com"></label>
+    <label class="lg-l">Senha<div class="pw-wrap"><input class="field" type="password" id="${p}P" autocomplete="current-password" minlength="6" required placeholder="mínimo 6 caracteres"><button type="button" class="pw-eye" data-eye="${p}P" aria-label="Mostrar senha">${ic("eye")}</button></div></label>
+    <div id="${p}Msg" class="lg-msg" hidden></div>
+    <button class="btn primary" type="submit" id="${p}Go">Entrar</button>
+    <button type="button" class="lg-switch" id="${p}Sw">Não tem conta? Criar uma</button>
+  </form>`;
+}
+function wireAuthForm(root, p, onSuccess, startMode) {
+  let mode = "in";
+  const g = (s) => $("#" + p + s, root);
+  const setMode = (mm) => {
+    mode = mm;
+    g("Go").textContent = mode === "in" ? "Entrar" : "Criar conta";
+    g("Sw").textContent = mode === "in" ? "Não tem conta? Criar uma" : "Já tem conta? Entrar";
+    g("P").setAttribute("autocomplete", mode === "in" ? "current-password" : "new-password");
+    const h = root.querySelector("[data-authtitle]"); if (h) h.textContent = mode === "in" ? "Entrar" : "Criar conta";
+  };
+  root.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-eye]"); if (!b) return;
+    const inp = $("#" + b.dataset.eye, root); if (!inp) return;
+    const show = inp.type === "password"; inp.type = show ? "text" : "password";
+    b.innerHTML = ic(show ? "eye-off" : "eye"); b.setAttribute("aria-label", show ? "Esconder senha" : "Mostrar senha");
+  });
+  g("Sw").onclick = () => { g("Msg").hidden = true; setMode(mode === "in" ? "up" : "in"); g("E").focus(); };
+  g("F").onsubmit = async (e) => {
+    e.preventDefault();
+    const email = g("E").value.trim(), pass = g("P").value;
+    const msg = g("Msg"); msg.hidden = true; msg.className = "lg-msg";
+    if (!email || pass.length < 6) { msg.hidden = false; msg.textContent = "Preencha o e-mail e uma senha de 6+ letras."; return; }
+    const btn = g("Go"); btn.disabled = true; const old = btn.textContent; btn.textContent = "Aguarde…";
+    const r = await doAuth(mode, email, pass);
+    if (r.ok) { onSuccess(); return; }
+    btn.disabled = false; btn.textContent = old;
+    msg.hidden = false;
+    if (r.needConfirm) { msg.className = "lg-msg ok"; msg.textContent = "Conta criada! Agora é só entrar."; setMode("in"); }
+    else msg.textContent = r.error;
+  };
+  if (startMode) setMode(startMode);
+}
+function loginModal() {
+  if (!SB) return;
+  const m = modal(`<div class="m-head"><div class="m-ic">${ic("restore")}</div><h2 data-authtitle>Entrar</h2><button class="ib" id="lgX" aria-label="Fechar">${ic("x")}</button></div>
+    <div class="m-body lg-body"><p class="sync-p">Use o mesmo e-mail e senha no PC e no celular pra sincronizar.</p>${authFormHTML("lg")}</div>`);
+  $("#lgX", m).onclick = () => m.close();
+  wireAuthForm(m, "lg", () => { m.close(); toast("Sincronização ligada ✨"); });
+  setTimeout(() => $("#lgE", m) && $("#lgE", m).focus(), 60);
+}
+function welcomeScreen() {
+  if (!SB || $("#welcome")) return;
+  const w = document.createElement("div");
+  w.id = "welcome"; w.className = "welcome";
+  w.innerHTML = `<div class="welcome-card">
+      <div class="welcome-logo"><img src="${ICON}" alt=""></div>
+      <h1 data-authtitle>Criar conta</h1>
+      <p class="welcome-sub">Bem-vindo ao ForeverNote! Crie sua conta pra suas notas, roteiros e tarefas ficarem iguais no PC e no celular.</p>
+      ${authFormHTML("wl")}
+      <button type="button" class="welcome-skip" id="wlSkip">Usar sem conta por enquanto</button>
+    </div>`;
+  document.body.appendChild(w);
+  const done = () => { try { localStorage.setItem("fn-welcomed", "1"); } catch (e) {} w.classList.add("out"); setTimeout(() => w.remove(), 360); };
+  wireAuthForm(w, "wl", () => { done(); toast("Sincronização ligada ✨"); }, "up");
+  $("#wlSkip", w).onclick = done;
+  requestAnimationFrame(() => w.classList.add("show"));
+  setTimeout(() => { const e = $("#wlE", w); if (e && !matchMedia("(max-width:640px)").matches) e.focus(); }, 450);
+}
+function maybeWelcome() {
+  if (!WEB || !SB || CLOUD.user) return;
+  let seen = true; try { seen = localStorage.getItem("fn-welcomed") === "1"; } catch (e) {}
+  if (!seen) welcomeScreen();
+}
+
+/* =========================================================
    Salvamento automático
    ========================================================= */
 const dirty = new Set(), deleted = new Set();
@@ -593,7 +865,7 @@ function setSave(state) {
   if (pill) pill.innerHTML = state === "busy" ? "Salvando…" : state === "err" ? "Erro ao salvar" : ic("check") + "Salvo";
 }
 function markNote(id) { const n = S.notes.get(id); if (n && n.tplEdit) { syncTpl(n); return; } dirty.add(id); queueSave(); }
-function markNotebooks() { nbDirty = true; queueSave(); }
+function markNotebooks() { nbDirty = true; S.nbUpdated = Date.now(); queueSave(); }
 function queueSave() { setSave("busy"); clearTimeout(saveTimer); saveTimer = setTimeout(flushSave, 450); }
 async function flushSave() {
   const ids = [...dirty]; dirty.clear();
@@ -607,6 +879,7 @@ async function flushSave() {
       nb ? api.saveNotebooks([...S.nbs.values()]) : null
     ]);
     saving--; if (!dirty.size && !saving) setSave("ok");
+    cloudSync(ids, dels, nb);
   } catch (e) {
     saving--; console.error(e); ids.forEach((id) => dirty.add(id)); if (nb) nbDirty = true; setSave("err");
     clearTimeout(saveTimer); saveTimer = setTimeout(flushSave, 3000);
@@ -930,6 +1203,7 @@ function renderPane(opts = {}) {
   const nb = S.nbs.get(n.nb);
   pane.innerHTML = `
     <div class="ed-top">
+      <button class="ib mob-back" data-act="mobback" aria-label="Voltar para a lista">${ic("left")}</button>
       <button class="ib" data-act="expand" id="btnExpand" title="${S.expanded ? "Mostrar cadernos e lista" : "Expandir nota"} (Ctrl+Shift+E)" aria-label="Expandir nota">${ic(S.expanded ? "uncollapse" : "collapse")}</button>
       <button class="ib" data-act="fullscreen" id="btnFull" title="${S.fullscreen ? "Sair da tela cheia" : "Tela cheia"} (F11)" aria-label="Tela cheia">${ic(S.fullscreen ? "shrink" : "expand")}</button>
       ${n.tplEdit ? `<div class="crumb"><button data-act="tplback">${ic("template")}<span>Modelos</span></button>${ic("chev-r", "sep")}<span class="cur" id="crumbTitle">${esc(titleOf(n))}</span></div>` : `<div class="crumb">
@@ -1922,6 +2196,7 @@ async function runUpdate(info) {
   /* se deu ok, o app fecha sozinho pra instalar */
 }
 function checkForUpdate(btn, m) {
+  if (!api.checkUpdate) return;
   const info = $("#sUpdInfo", m); if (!info) return;
   btn.disabled = true; const old = btn.innerHTML; btn.innerHTML = `${ic("restore")}Procurando…`;
   api.checkUpdate().then((r) => {
@@ -2042,8 +2317,16 @@ function setSel(sel) {
   S.sel = sel; S.q = ""; $("#search").value = ""; S.picked.clear(); S.lastPick = null;
   if (CSS.highlights) CSS.highlights.delete("busca");
   $("#app").classList.remove("drawer");
+  mobShowList();
   renderSidebar(); renderList(true); saveSession();
 }
+/* navegação de celular: lista ⇄ nota */
+const mqMobile = matchMedia("(max-width:640px)");
+function mobShowList() { $("#app")?.classList.remove("note-open"); }
+function mobShowNote() { if (mqMobile.matches) { $("#app")?.classList.add("note-open"); try { history.pushState({ fn: "note" }, ""); } catch (e) {} } }
+function applyMobile() { document.documentElement.classList.toggle("mobile", mqMobile.matches); if (!mqMobile.matches) mobShowList(); }
+mqMobile.addEventListener("change", applyMobile);
+addEventListener("popstate", () => { if ($("#app")?.classList.contains("note-open")) mobShowList(); });
 function openNote(id, o = {}) {
   if (!S.notes.has(id)) return;
   if (TPLED && id !== TPLED.id) endTplEdit(true);
@@ -2054,6 +2337,7 @@ function openNote(id, o = {}) {
   if (!o.noHist) pushHist(id);
   renderTabs(); renderPane(o);
   $$(".card").forEach((c) => c.classList.toggle("on", c.dataset.note === id));
+  mobShowNote();
   saveSession();
 }
 function closeTab(id) {
@@ -2304,11 +2588,12 @@ function sortPop(btn) {
 function settingsModal(tab) {
   const P = S.prefs;
   let cur = tab || "geral", meterStop = null;
-  const TABS = [["geral", "folder", "Geral"], ["aparencia", "palette", "Aparência"], ["editor", "type", "Editor"], ["voz", "mic", "Microfone e voz"], ["atalhos", "keyboard", "Atalhos"]];
+  const TABS = [["geral", "folder", "Geral"], ["aparencia", "palette", "Aparência"], ["editor", "type", "Editor"], ...(WEB ? [] : [["voz", "mic", "Microfone e voz"], ["atalhos", "keyboard", "Atalhos"]])];
   const sw = (k, label, sub) => `<div class="set-row"><div class="sl"><b>${label}</b><span>${sub}</span></div><button class="switch${P[k] ? " on" : ""}" data-sw="${k}" role="switch" aria-checked="${!!P[k]}" aria-label="${label}"></button></div>`;
   const pane = {
-    geral: () => `<div class="set-card pad about-card"><div class="about"><img src="../build/icon.png" alt=""><div><b>ForeverNote</b><br><span>by revmpt · versão ${esc(appVer())}</span></div><button class="btn" id="sUpd">${ic("restore")}Procurar atualizações</button></div><div id="sUpdInfo" class="upd-info" hidden></div></div><h3>Geral</h3>
-      <div class="set-card pad"><b>Onde as notas ficam salvas</b><div class="path-box">${esc(S.dataDir)}</div>
+    geral: () => `<div class="set-card pad about-card"><div class="about"><img src="${ICON}" alt=""><div><b>ForeverNote</b><br><span>by revmpt · ${WEB ? "versão celular" : "versão " + esc(appVer())}</span></div>${WEB ? "" : `<button class="btn" id="sUpd">${ic("restore")}Procurar atualizações</button>`}</div><div id="sUpdInfo" class="upd-info" hidden></div></div><h3>Geral</h3>
+      ${syncCardHTML()}
+      ${WEB ? "" : `<div class="set-card pad"><b>Onde as notas ficam salvas</b><div class="path-box">${esc(S.dataDir)}</div>
         <p style="font-size:12.5px;color:var(--muted);margin:0">Para ter uma cópia na nuvem, escolha uma pasta dentro do <b>Google Drive</b> (por exemplo, “Meu Drive”). As notas atuais são copiadas para lá.</p>
         <div class="opts"><button class="btn" id="sOpen">${ic("folder")}Abrir pasta</button><button class="btn" id="sChange">Trocar pasta…</button></div></div>
       <div class="set-card"><div class="set-row"><div class="sl"><b>Nota rápida</b><span>Clique no ícone do ForeverNote na bandeja (perto do relógio) ou use o atalho</span></div><kbd>Ctrl+Alt+N</kbd></div>
@@ -2316,16 +2601,16 @@ function settingsModal(tab) {
         ${sw("minToTray", "Minimizar leva para a bandeja", "Ao minimizar, o app some da barra de tarefas e fica perto do relógio.")}
         ${sw("startLogin", "Iniciar com o Windows", "Abre escondido na bandeja quando o computador liga, pronto para notas rápidas.")}</div>
       <div class="set-card pad"><div style="display:flex;align-items:center;gap:12px"><span class="ev-logo">${ic("restore")}</span><div style="flex:1"><b>Importar do Evernote</b><p style="font-size:12.5px;color:var(--muted);margin:2px 0 0">Traz cadernos, notas, etiquetas, imagens e anexos, mantendo as datas de criação e edição.</p></div><button class="btn primary" id="sEnex">Importar…</button></div></div>
-      <div class="set-card pad"><b>Cópias de segurança</b><p style="font-size:12.5px;color:var(--muted);margin:0">Todo dia o app guarda uma cópia de todas as suas notas, cadernos, imagens e áudios. As cópias dos últimos 14 dias ficam disponíveis, e notas excluídas da lixeira podem ser recuperadas por 14 dias. Suas notas em si nunca são apagadas.</p><div class="opts"><button class="btn primary" id="sRestore">${ic("restore")}Restaurar…</button><button class="btn" id="sBackups">${ic("folder")}Abrir pasta das cópias</button></div></div>`,
+      <div class="set-card pad"><b>Cópias de segurança</b><p style="font-size:12.5px;color:var(--muted);margin:0">Todo dia o app guarda uma cópia de todas as suas notas, cadernos, imagens e áudios. As cópias dos últimos 14 dias ficam disponíveis, e notas excluídas da lixeira podem ser recuperadas por 14 dias. Suas notas em si nunca são apagadas.</p><div class="opts"><button class="btn primary" id="sRestore">${ic("restore")}Restaurar…</button><button class="btn" id="sBackups">${ic("folder")}Abrir pasta das cópias</button></div></div>`}`,
     aparencia: () => `<h3>Aparência</h3>
-      <div class="set-card"><div class="set-row"><div class="sl"><b>Tema</b><span>Claro, escuro ou igual ao Windows</span></div><div class="seg" id="sTheme">${[["system", "Sistema"], ["light", "Claro"], ["dark", "Escuro"]].map(([v, l]) => `<button data-theme="${v}" class="${P.theme === v ? "on" : ""}">${l}</button>`).join("")}</div></div>
+      <div class="set-card"><div class="set-row"><div class="sl"><b>Tema</b><span>Claro, escuro ou igual ao ${WEB ? "sistema" : "Windows"}</span></div><div class="seg" id="sTheme">${[["system", "Sistema"], ["light", "Claro"], ["dark", "Escuro"]].map(([v, l]) => `<button data-theme="${v}" class="${P.theme === v ? "on" : ""}">${l}</button>`).join("")}</div></div>
       ${sw("anim", "Animações", "Transições suaves ao abrir notas, menus e janelas.")}
       ${sw("wide", "Texto em largura total", "Usa toda a largura da tela para o texto das notas.")}</div>`,
     editor: () => `<h3>Editor</h3>
       <div class="set-card"><div class="set-row"><div class="sl"><b>Fonte padrão das notas</b><span>Usada no texto sem fonte escolhida</span></div><select class="field" id="sFont" style="width:180px">${FONTS.map(([k, l, st]) => `<option value="${esc(k === "fn-sans" ? "" : st)}"${(P.font || "") === (k === "fn-sans" ? "" : st) ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>
       <div class="set-row"><div class="sl"><b>Tamanho padrão</b><span>Tamanho da letra do texto da nota</span></div><select class="field" id="sSize" style="width:90px">${[13, 14, 15, 16, 17, 18, 20].map((x) => `<option${(P.size || 16) === x ? " selected" : ""}>${x}</option>`).join("")}</select></div>
       <div class="set-row"><div class="sl"><b>Ritmo de fala</b><span>Usado no tempo estimado que aparece no rodapé da nota</span></div><div class="seg" id="sWpm">${PACES.map(([v, l]) => `<button data-wpm="${v}" class="${(P.wpm || 150) === v ? "on" : ""}" title="${v} palavras por minuto">${l}</button>`).join("")}</div></div>
-      ${sw("spell", "Correção ortográfica", "Sublinha palavras erradas. Botão direito mostra sugestões.")}
+      ${sw("spell", "Correção ortográfica", WEB ? "Sublinha palavras erradas enquanto você escreve." : "Sublinha palavras erradas. Botão direito mostra sugestões.")}
       ${sw("autocap", "Maiúscula automática", "Começa frases com letra maiúscula.")}
       ${sw("autolink", "Links automáticos", "Transforma www.site.com em link clicável.")}
       ${sw("hints", "Dica na linha vazia", "Mostra “Digite / para comandos ou @ para vincular uma nota”.")}
@@ -2387,6 +2672,8 @@ function settingsModal(tab) {
     if (t.id === "sRestore") { m.close(); setTimeout(restoreModal, 180); }
     if (t.id === "sEnex") { m.close(); setTimeout(importEvernote, 180); }
     if (t.id === "sUpd") checkForUpdate(t, m);
+    if (t.id === "syncIn") loginModal();
+    if (t.id === "syncOut") { if (await ask({ title: "Sair da conta?", text: "Suas notas continuam neste aparelho, mas param de sincronizar até você entrar de novo.", ok: "Sair", danger: true, icon: "restore" })) { await cloudSignOut(); refreshSyncUI(); toast("Você saiu da conta"); } }
     if (t.id === "sChange") { flushSave(); const r = await api.chooseFolder(); if (r) { toast(r.usedExisting ? "Usando as notas que já estavam nessa pasta" : "Notas copiadas para a nova pasta"); setTimeout(() => (api.reload ? api.reload() : location.reload()), 900); } }
     if (t.dataset.theme) { P.theme = t.dataset.theme; $$("#sTheme button", m).forEach((b) => b.classList.toggle("on", b === t)); savePrefs(); }
     if (t.dataset.wpm) { P.wpm = +t.dataset.wpm; $$("#sWpm button", m).forEach((b) => b.classList.toggle("on", b === t)); savePrefs(); updateWordCount(); }
@@ -2580,7 +2867,7 @@ function trigItems() {
   const q = norm(TRIG.q.replace(/ /g, " ")).trim();
   if (TRIG.kind === "/") {
     const out = []; let sec = null;
-    SLASH.forEach((it) => { if (it.sec) { sec = it.sec; return; } if (!q || norm(it.label + " " + (it.kw || "")).includes(q)) out.push({ ...it, secName: sec }); });
+    SLASH.forEach((it) => { if (it.sec) { sec = it.sec; return; } if (WEB && it.id === "mic") return; if (!q || norm(it.label + " " + (it.kw || "")).includes(q)) out.push({ ...it, secName: sec }); });
     return out;
   }
   const notes = [...S.notes.values()].filter((n) => !n.trashed && n.id !== (ED && ED.id)).filter((n) => !q || norm(titleOf(n) + " " + nbName(n.nb)).includes(q))
@@ -3049,6 +3336,7 @@ document.addEventListener("click", async (e) => {
     case "sideNewTpl": templatePicker(); break;
     case "tpldone": endTplEdit(); break;
     case "tplback": endTplEdit(); break;
+    case "mobback": if (history.state && history.state.fn === "note") history.back(); else mobShowList(); break;
     case "navBack": goHist(-1); break;
     case "navFwd": goHist(1); break;
     case "drawerBtn": $("#app").classList.toggle("drawer"); break;
@@ -3392,13 +3680,18 @@ async function init() {
   if (ss.expanded) { S.expanded = true; $("#app").classList.add("expanded"); }
   $("#app").classList.add("booting");
   renderSidebar(); renderList(true); renderTabs(); renderPane();
+  applyMobile();
+  if (WEB && "serviceWorker" in navigator) { try { navigator.serviceWorker.register("sw.js"); } catch (e) {} }
+  await cloudInit(); maybeWelcome();
   setTimeout(() => $("#app").classList.remove("booting"), 1100);
   setSave("ok");
   checkReminders(); setInterval(checkReminders, 20000);
-  /* aviso ao abrir logo após uma atualização (não em instalação nova) */
-  const curVer = appVer();
-  if (!d.firstRun && S.prefs.lastVer !== curVer) setTimeout(() => toast("✨ Atualizado para a versão " + curVer), 1400);
-  if (S.prefs.lastVer !== curVer) { S.prefs.lastVer = curVer; savePrefs(); }
+  /* aviso ao abrir logo após uma atualização (só no app de PC, não no navegador) */
+  if (!WEB) {
+    const curVer = appVer();
+    if (!d.firstRun && S.prefs.lastVer !== curVer) setTimeout(() => toast("✨ Atualizado para a versão " + curVer), 1400);
+    if (S.prefs.lastVer !== curVer) { S.prefs.lastVer = curVer; savePrefs(); }
+  }
   setTimeout(() => cleanAttachments(864e5), 8000);
   setInterval(() => { updateStamp(false); if (!ED || document.activeElement?.id === "tagIn" || $(".suggest")) return; renderFoot(); }, 60000);
   if ("Notification" in window && Notification.permission === "default") try { Notification.requestPermission(); } catch (e) {}

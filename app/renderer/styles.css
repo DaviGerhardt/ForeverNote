@@ -1025,3 +1025,108 @@ html.no-anim *,html.no-anim *::before,html.no-anim *::after{animation-duration:.
 .upd-li::before{content:"";position:absolute;left:4px;top:8px;width:5px;height:5px;border-radius:50%;background:var(--accent)}
 @media (max-width:560px){.update-banner{flex-wrap:wrap}.update-banner .ub-txt{order:-1;flex-basis:100%}}
 .no-anim .update-banner{animation:none}
+
+/* =========================================================
+   Layout de celular (uma tela por vez)
+   ========================================================= */
+.mob-back{display:none}
+@media (max-width:640px){
+  .titlebar{display:none}
+  .body{height:100%;grid-template-columns:1fr}
+  .app.expanded .body{grid-template-columns:1fr}
+  .app.expanded .list{opacity:1;pointer-events:auto}
+  .sidebar{top:0;width:86vw;max-width:330px;border-radius:0 var(--r-xl) var(--r-xl) 0}
+  .drawer-scrim{inset:0}
+  .list{border-left:0;border-right:0;border-top-left-radius:0}
+  .list-head{padding-top:calc(14px + env(safe-area-inset-top,0px))}
+  /* a nota entra deslizando por cima da lista */
+  .editor-pane{position:fixed;inset:0;z-index:40;transform:translateX(100%);transition:transform .32s var(--ease);box-shadow:none;border-top-left-radius:0;border-top:0;background:var(--surface)}
+  .app.note-open .editor-pane{transform:none}
+  .ed-top{padding-top:calc(8px + env(safe-area-inset-top,0px))}
+  .mob-back{display:grid}
+  #btnExpand,#btnFull,.ed-top .crumb .sep,.ed-top [data-crumb="stack"]{display:none}
+  .ed-top .crumb{flex:1;min-width:0}
+  .ed-top .crumb .cur{font-weight:600}
+  .page{padding:18px 18px 130px}
+  .ed-foot{padding-bottom:calc(10px + env(safe-area-inset-bottom,0px))}
+  /* alvos de toque maiores */
+  .card{padding:14px 12px 13px 14px}
+  .foot-btn,.ib{min-height:38px}
+  .tv-head{padding:14px 16px 10px}
+  .app.tplmode .tv{border-radius:0}
+  /* esconder a aba Modelos em tela cheia ocupa toda a largura */
+  .app.tplmode .tv.has-side{grid-template-columns:1fr 0px}
+}
+.no-anim .editor-pane{transition:none}
+
+/* =========================================================
+   Correções mobile v2: configurações, modelos, voz no web
+   ========================================================= */
+/* gravação/transcrição não existem no app web */
+html.web [data-cmd="mic"]{display:none}
+@media (max-width:640px){
+  /* linhas de configuração com seletor/segmento empilham (evita texto na vertical) */
+  .set-row:has(.seg),.set-row:has(select.field){flex-direction:column;align-items:stretch;gap:9px}
+  .set-row:has(.seg) .sl,.set-row:has(select.field) .sl{min-width:0}
+  .set-row:has(.seg) .seg,.set-row:has(select.field) select.field{width:100%}
+  .set-row:has(select.field) select.field{max-width:none}
+  .set-row .seg button{flex:1}
+  .set-row kbd{align-self:flex-start}
+  /* aba Modelos: botão "Novo modelo" acompanha a tela */
+  .tv-head{flex-wrap:wrap;align-items:center}
+  .tv-head .btn.primary{width:100%;justify-content:center;margin-top:2px;order:3}
+  .tv-h{flex:1 1 100%}
+}
+
+/* =========================================================
+   Nuvem: login e status de sincronização
+   ========================================================= */
+.sync-p{font-size:12.5px;color:var(--muted);margin:6px 0 12px;line-height:1.5}
+.sync-row{display:flex;align-items:center;gap:12px}
+.sync-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.sync-info b{font-weight:600;font-size:14px}
+.sync-info span{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sync-row .btn{flex:none}
+.sync-dot{width:10px;height:10px;border-radius:50%;flex:none;background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 20%,transparent)}
+.sync-dot.syncing{background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);animation:syncPulse 1s ease-in-out infinite}
+.sync-dot.err{background:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}
+.sync-dot.off{background:var(--faint);box-shadow:none}
+@keyframes syncPulse{0%,100%{opacity:1}50%{opacity:.4}}
+.lg-body{display:flex;flex-direction:column;gap:12px}
+.lg-l{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--muted)}
+.lg-l .field{height:40px;font-size:15px}
+.lg-msg{font-size:13px;color:var(--danger);background:var(--danger-soft);padding:9px 12px;border-radius:var(--r);animation:dropIn .2s var(--ease)}
+.lg-msg.ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,transparent)}
+.lg-body .btn.primary{height:42px;margin-top:2px}
+.lg-switch{font-size:13px;color:var(--accent);font-weight:600;padding:6px;align-self:center}
+.lg-switch:hover{text-decoration:underline}
+
+/* =========================================================
+   Olho da senha + tela de boas-vindas
+   ========================================================= */
+.auth-form{display:flex;flex-direction:column;gap:11px}
+.pw-wrap{position:relative;display:flex;align-items:center}
+.pw-wrap .field{flex:1;padding-right:42px;width:100%}
+.pw-eye{position:absolute;right:5px;width:32px;height:32px;border-radius:8px;display:grid;place-items:center;color:var(--faint);transition:color .2s,background .2s}
+.pw-eye:hover{color:var(--fg);background:var(--hover)}
+.pw-eye:active{transform:scale(.9)}
+.pw-eye svg.i{width:18px;height:18px}
+
+.welcome{position:fixed;inset:0;z-index:200;display:grid;place-items:center;padding:20px;padding-top:max(20px,env(safe-area-inset-top));padding-bottom:max(20px,env(safe-area-inset-bottom));background:color-mix(in srgb,var(--bg) 60%,transparent);backdrop-filter:blur(18px) saturate(1.2);-webkit-backdrop-filter:blur(18px) saturate(1.2);opacity:0;transition:opacity .4s var(--ease);overflow:auto}
+.welcome.show{opacity:1}
+.welcome.out{opacity:0}
+.welcome-card{width:100%;max-width:382px;background:var(--raised);border:1px solid var(--line);border-radius:var(--r-xl);box-shadow:0 40px 90px -30px rgba(0,0,0,.6),0 0 0 1px var(--line-soft);padding:30px 26px 20px;text-align:center;transform:translateY(18px) scale(.96);opacity:0;transition:transform .55s var(--spring),opacity .4s var(--ease)}
+.welcome.show .welcome-card{transform:none;opacity:1}
+.welcome.out .welcome-card{transform:translateY(8px) scale(.98)}
+.welcome-logo{display:flex;justify-content:center;margin-bottom:16px}
+.welcome-logo img{width:66px;height:66px;border-radius:19px;box-shadow:0 16px 36px -12px var(--accent);animation:wlLogo .75s var(--spring) .12s backwards}
+@keyframes wlLogo{from{opacity:0;transform:scale(.55) rotate(-10deg)}to{opacity:1;transform:none}}
+.welcome-card h1{font:650 23px var(--display);margin:0 0 7px;letter-spacing:-.01em;animation:wlUp .5s var(--ease) .18s backwards}
+.welcome-sub{font-size:13.5px;color:var(--muted);line-height:1.55;margin:0 0 22px;animation:wlUp .5s var(--ease) .24s backwards}
+.welcome .auth-form{text-align:left;animation:wlUp .5s var(--ease) .3s backwards}
+.welcome .lg-l{font-size:12.5px;color:var(--muted)}
+.welcome .auth-form .btn.primary{height:44px;margin-top:3px}
+.welcome-skip{margin-top:15px;font-size:13px;color:var(--muted);padding:9px;border-radius:8px;transition:color .2s,background .2s;animation:wlUp .5s var(--ease) .36s backwards}
+.welcome-skip:hover{color:var(--fg);background:var(--hover)}
+@keyframes wlUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.no-anim .welcome,.no-anim .welcome-card,.no-anim .welcome-logo img,.no-anim .welcome-card h1,.no-anim .welcome-sub,.no-anim .welcome .auth-form,.no-anim .welcome-skip{animation:none;transition:none}

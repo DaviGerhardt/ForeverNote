@@ -1,4 +1,4 @@
 {
-  "version": "2.5.0",
-  "notes": "Atualização silenciosa de verdade — sem janela preta nenhuma\nAviso ao abrir confirmando a nova versão\nPequenos ajustes de estabilidade"
+  "version": "2.6.0",
+  "notes": "Sincronização com a nuvem chegou ao PC! Entre com uma conta (Configurações › Sincronizar) e suas notas ficam iguais no PC e no celular.\nLogin com olhinho para ver a senha.\nAtualização automática entre aparelhos, sem recarregar."
 }
