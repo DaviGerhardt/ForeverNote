@@ -982,11 +982,12 @@ function hl(text) {
   return out + esc(text.slice(p));
 }
 function snippet(n) {
+  if (n.kind === "moodboard") { const c = boardCount(n); const ts = (n.board && n.board.items || []).filter((i) => i.type === "text" && i.text).map((i) => i.text).join(" · "); return "Moodboard" + (c ? " · " + plural(c, "foto", "fotos") : "") + (ts ? " · " + ts : ""); }
   const b = (n.text || "").replace(/\s+/g, " ").trim();
   if (S.q) { const w = norm(S.q).split(/\s+/)[0]; const i = norm(b).indexOf(w); if (i > 50) return "…" + b.slice(i - 36, i + 140); }
   return b.slice(0, 180);
 }
-const firstImg = (n) => { const m = /<img[^>]+src="([^"]+)"/i.exec(n.html || ""); return m ? m[1] : null; };
+const firstImg = (n) => { if (n.kind === "moodboard") return boardThumb(n); const m = /<img[^>]+src="([^"]+)"/i.exec(n.html || ""); return m ? m[1] : null; };
 
 /* =========================================================
    Barra lateral
@@ -1201,6 +1202,7 @@ function renderPane(opts = {}) {
     return;
   }
   const nb = S.nbs.get(n.nb);
+  if (n.kind === "moodboard") { ED = null; renderBoard(n, opts); return; }
   pane.innerHTML = `
     <div class="ed-top">
       <button class="ib mob-back" data-act="mobback" aria-label="Voltar para a lista">${ic("left")}</button>
@@ -3315,7 +3317,8 @@ document.addEventListener("click", async (e) => {
   if (b.dataset.crumb === "nb") { moveMenu(b, S.active); return; }
   if (b.dataset.crumb === "stack") { const nb = S.nbs.get(S.notes.get(S.active)?.nb); if (nb) setSel({ type: "stack", id: nb.stack }); return; }
   switch (b.dataset.act || b.id) {
-    case "new": case "sideNew": case "listNew": case "tabAdd": newNote(); break;
+    case "new": case "sideNew": case "tabAdd": newNote(); break;
+    case "listNew": menu(b, [{ icon: "note-add", label: "Nova nota", k: "Ctrl+N", run: () => newNote() }, { icon: "board", label: "Novo moodboard", run: () => moodboardPicker() }], { right: true }); break;
     case "sideNewNb": case "secNewNb": newNotebook(); break;
     case "sideSettings": settingsModal(); break;
     case "listFilter": filterModal(); break;
@@ -3649,6 +3652,391 @@ function welcomeNote(nbId) {
   const tmp = document.createElement("div"); tmp.innerHTML = html;
   return { id: uid("nt_"), nb: nbId, title: "Bem-vindo ao ForeverNote", html, text: tmp.innerText, tags: ["começo"], prio: 0, reminder: null, reminderDone: false, fav: true, trashed: false, created: now, updated: now };
 }
+
+/* =========================================================
+   Moodboard: painel visual (fotos, cores, textos)
+   ========================================================= */
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const boardFontCss = (f) => ({ serif: "Lora, Georgia, serif", slab: "'Roboto Slab', serif", script: "'Dancing Script', cursive", hand: "Caveat, 'Segoe Print', cursive" }[f] || "var(--ui)");
+const BOARD_FONTS = [["", "Padrão"], ["serif", "Serif"], ["slab", "Slab"], ["script", "Script"], ["hand", "À mão"]];
+const BOARD_RATIOS = [["Retrato", 1.25], ["Quadrado", 1], ["Paisagem", 0.7], ["Story", 1.78]];
+function blankBoard() { return { bg: "#faf6f4", ratio: 1.25, items: [] }; }
+let BRD = null; // { id (note id), sel: itemId|null, drag:null }
+
+/* ---------- templates de grade ---------- */
+function gridCells(cols, rows, area, pad, rad) {
+  area = area || { x: 0, y: 0, w: 100, h: 100 }; pad = pad == null ? 2.2 : pad; rad = rad == null ? 10 : rad;
+  const items = [], gw = (area.w - pad * (cols + 1)) / cols, gh = (area.h - pad * (rows + 1)) / rows;
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) items.push({ id: uid("mb_"), type: "image", src: "", x: +(area.x + pad + c * (gw + pad)).toFixed(2), y: +(area.y + pad + r * (gh + pad)).toFixed(2), w: +gw.toFixed(2), h: +gh.toFixed(2), z: items.length, rad });
+  return items;
+}
+function paletteRow(y, n, colors) {
+  const items = [], gap = 3, d = Math.min((100 - gap * (n + 1)) / n, 15), total = n * d + (n - 1) * gap, x0 = (100 - total) / 2;
+  for (let i = 0; i < n; i++) items.push({ id: uid("mb_"), type: "color", color: (colors && colors[i]) || "#e9c7c0", x: +(x0 + i * (d + gap)).toFixed(2), y, w: +d.toFixed(2), z: 50 + i, rad: 50 });
+  return items;
+}
+const BOARD_TEMPLATES = [
+  { id: "blank", name: "Em branco", desc: "Comece do zero", make: () => blankBoard() },
+  { id: "g22", name: "Grade 2 × 2", desc: "Quatro fotos", make: () => ({ bg: "#faf6f4", ratio: 1, items: gridCells(2, 2) }) },
+  { id: "g33", name: "Grade 3 × 3", desc: "Nove fotos, estilo clássico", make: () => ({ bg: "#faf6f4", ratio: 1.25, items: gridCells(3, 3) }) },
+  { id: "g23", name: "Grade 2 × 3", desc: "Seis fotos na vertical", make: () => ({ bg: "#faf6f4", ratio: 1.3, items: gridCells(2, 3) }) },
+  { id: "pal", name: "Fotos + paleta", desc: "Grade com fileira de cores embaixo", make: () => ({ bg: "#fff", ratio: 1.2, items: [...gridCells(3, 2, { x: 0, y: 0, w: 100, h: 84 }), ...paletteRow(88, 5)] }) },
+  { id: "glam", name: "Conceito", desc: "Título, fotos e paleta", make: () => ({ bg: "#fbf3f4", ratio: 1.3, items: [
+    { id: uid("mb_"), type: "text", text: "CONCEITO", x: 6, y: 5, w: 60, h: 8, z: 99, color: "#20151a", size: 5.2, font: "slab", weight: 700, align: "left", spacing: 2 },
+    ...gridCells(3, 2, { x: 4, y: 16, w: 92, h: 66 }), ...paletteRow(86, 5)
+  ] }) }
+];
+
+/* ---------- criar / abrir ---------- */
+function newMoodboard(tplId) {
+  const t = BOARD_TEMPLATES.find((x) => x.id === tplId) || BOARD_TEMPLATES[0];
+  newNote({ kind: "moodboard", title: t.id === "blank" ? "" : "Moodboard", board: t.make(), text: "Moodboard" });
+}
+function moodboardPicker() {
+  const m = modal(`<div class="m-head"><div class="m-ic">${ic("board")}</div><h2>Novo moodboard</h2><button class="ib" id="mbX" aria-label="Fechar">${ic("x")}</button></div>
+    <div class="m-body tpl-body"><div class="tpl-grid mb-grid">${BOARD_TEMPLATES.map((t, i) => `<div class="tpl mb-tpl" role="button" tabindex="0" data-mbt="${t.id}" style="--i:${i}">
+      <div class="tpl-prev mb-prev">${boardPreviewHTML(t.make())}</div>
+      <div class="tpl-meta"><span class="tpl-ic">${ic("board")}</span><div><b>${esc(t.name)}</b><span>${esc(t.desc)}</span></div></div></div>`).join("")}</div></div>`, { wide: true });
+  m.querySelector(".modal").classList.add("tpl-modal");
+  const pick = (id) => { m.close(); newMoodboard(id); };
+  m.addEventListener("click", (e) => { if (e.target.closest("#mbX")) return m.close(); const c = e.target.closest("[data-mbt]"); if (c) pick(c.dataset.mbt); });
+  m.addEventListener("keydown", (e) => { const c = e.target.closest?.("[data-mbt]"); if (c && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); pick(c.dataset.mbt); } });
+}
+function boardPreviewHTML(board) {
+  const its = [...(board.items || [])].sort((a, b) => (a.z || 0) - (b.z || 0));
+  return `<div class="mb-mini" style="background:${esc(board.bg || "#faf6f4")};aspect-ratio:${(1 / (board.ratio || 1.25)).toFixed(3)}">${its.map((it) => mbItemMini(it)).join("")}</div>`;
+}
+function mbItemMini(it) {
+  const base = `position:absolute;left:${it.x}%;top:${it.y}%;width:${it.w}%;`;
+  if (it.type === "image") return `<div style="${base}height:${it.h}%;border-radius:${(it.rad || 8) / 3}px;background:${it.src ? `center/cover url(${it.src})` : "var(--line)"}"></div>`;
+  if (it.type === "color") return `<div style="${base}aspect-ratio:1;border-radius:50%;background:${esc(it.color)}"></div>`;
+  if (it.type === "text") return `<div style="${base}height:${it.h}%;font-size:6px;color:${esc(it.color || "#000")};font-weight:${it.weight || 600};overflow:hidden">${esc(it.text || "")}</div>`;
+  return "";
+}
+
+/* ---------- render do editor ---------- */
+function renderBoard(n, opts) {
+  BRD = BRD && BRD.id === n.id ? BRD : { id: n.id, sel: null };
+  const pane = $("#pane");
+  const b = n.board || (n.board = blankBoard());
+  pane.innerHTML = `
+    <div class="ed-top mb-top">
+      <button class="ib mob-back" data-act="mobback" aria-label="Voltar">${ic("left")}</button>
+      <button class="ib" data-act="expand" title="Expandir" aria-label="Expandir">${ic(S.expanded ? "uncollapse" : "collapse")}</button>
+      <div class="crumb"><button data-crumb="nb" title="Mover para outro caderno">${ic("book")}<span>${esc(nbName(n.nb))}</span></button>${ic("chev-r", "sep")}<span class="cur">${esc(titleOf(n))}</span></div>
+      <span class="status-pill" id="edStatus">${ic("check")}Salvo</span>
+      <button class="ib star${n.fav ? " on" : ""}" data-act="fav" title="Favoritar" aria-label="Favoritar">${ic("star")}</button>
+      <button class="btn sm mb-export" data-mb="export" title="Exportar como imagem">${ic("download")}<span>Exportar</span></button>
+      <button class="ib" data-act="notemenu" title="Mais opções" aria-label="Mais opções">${ic("more")}</button>
+    </div>
+    ${n.trashed ? `<div class="trash-banner">${ic("trash")}<span>Este moodboard está na lixeira.</span><button class="btn" data-act="restore">${ic("restore")}Restaurar</button><button class="btn danger" data-act="purge">Excluir para sempre</button></div>` : `
+    <div class="mb-tools" id="mbTools">
+      <input class="mb-title" id="mbTitle" placeholder="Título do moodboard" value="${esc(n.title || "")}" spellcheck="false">
+      <div class="mb-tbar">
+        <button class="mb-tb" data-mb="addimg">${ic("image")}<span>Foto</span></button>
+        <button class="mb-tb" data-mb="addtext">${ic("type")}<span>Texto</span></button>
+        <button class="mb-tb" data-mb="addcolor">${ic("swatch")}<span>Cor</span></button>
+        <button class="mb-tb" data-mb="palette">${ic("palette")}<span>Paleta das fotos</span></button>
+        <button class="mb-tb" data-mb="bg"><span class="mb-bgdot" style="background:${esc(b.bg)}"></span><span>Fundo</span></button>
+      </div>
+    </div>`}
+    <div class="mb-stage" id="mbStage"><div class="mb-canvas" id="mbCanvas" style="background:${esc(b.bg)};aspect-ratio:${(1 / (b.ratio || 1.25)).toFixed(3)}"></div></div>
+    <input type="file" id="mbFile" accept="image/*" hidden>`;
+  renderBoardItems();
+  if (!n.trashed) wireBoard(n);
+  const t = $("#mbTitle"); if (t) { t.oninput = () => { n.title = t.value; n.updated = Date.now(); markNote(n.id); renderList(false, true); renderTabs(); }; if (opts && opts.focusTitle) setTimeout(() => t.focus(), 60); }
+}
+function renderBoardItems() {
+  const n = S.notes.get(BRD.id); if (!n) return;
+  const cv = $("#mbCanvas"); if (!cv) return;
+  const its = [...(n.board.items || [])].sort((a, b) => (a.z || 0) - (b.z || 0));
+  cv.innerHTML = its.map((it) => mbItemHTML(it)).join("");
+  if (BRD.sel) { const el = cv.querySelector(`[data-it="${BRD.sel}"]`); if (el) selectItem(BRD.sel, true); }
+}
+function mbItemHTML(it) {
+  const pos = `left:${it.x}%;top:${it.y}%;width:${it.w}%;height:${it.h}%;z-index:${it.z || 0}`;
+  const sel = it.id === BRD.sel ? " sel" : "";
+  if (it.type === "image") return `<div class="mb-item mb-image${sel}${it.src ? "" : " empty"}" data-it="${it.id}" style="${pos};border-radius:${it.rad || 10}px">${it.src ? `<img src="${it.src}" style="border-radius:${it.rad || 10}px" draggable="false">` : `<span class="mb-add">${ic("plus")}<b>Foto</b></span>`}${handlesHTML()}</div>`;
+  if (it.type === "color") return `<div class="mb-item mb-color${sel}" data-it="${it.id}" style="left:${it.x}%;top:${it.y}%;width:${it.w}%;z-index:${it.z || 0};background:${esc(it.color)};border-radius:${it.rad != null ? it.rad : 50}%">${handlesHTML()}</div>`;
+  if (it.type === "text") return `<div class="mb-item mb-text${sel}" data-it="${it.id}" style="${pos};color:${esc(it.color || "#20151a")};font:${it.weight || 600} ${it.size || 4}cqw/1.15 ${boardFontCss(it.font)};text-align:${it.align || "left"};letter-spacing:${(it.spacing || 0)}px"><span class="mb-tcontent">${esc(it.text || "Texto")}</span>${handlesHTML()}</div>`;
+  return "";
+}
+const handlesHTML = () => `<span class="mb-h br" data-h="br"></span>`;
+
+/* ---------- interação (arrastar / redimensionar / selecionar) ---------- */
+function mbPaneClick(e) { const b = e.target.closest("[data-mb]"); if (b) { e.preventDefault(); mbToolbarClick(b.dataset.mb); } }
+function wireBoard(n) {
+  const pane = $("#pane");
+  pane.removeEventListener("click", mbPaneClick); pane.addEventListener("click", mbPaneClick);
+  const file = $("#mbFile");
+  if (file) file.addEventListener("change", (e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (f) mbFilePicked(f); });
+  const cv = $("#mbCanvas");
+  cv.addEventListener("pointerdown", (e) => {
+    const h = e.target.closest(".mb-h");
+    const itEl = e.target.closest(".mb-item");
+    if (!itEl) { selectItem(null); return; }
+    const id = itEl.dataset.it;
+    const wasSel = BRD.sel === id;
+    selectItem(id);
+    const it = n.board.items.find((x) => x.id === id); if (!it) return;
+    const rect = cv.getBoundingClientRect();
+    e.preventDefault(); itEl.setPointerCapture?.(e.pointerId);
+    const isColor = it.type === "color";
+    const start = { px: e.clientX, py: e.clientY, x: it.x, y: it.y, w: it.w, h: it.h, mode: h ? "resize" : "move" };
+    let moved = false;
+    const onMove = (ev) => {
+      const dx = (ev.clientX - start.px) / rect.width * 100, dy = (ev.clientY - start.py) / rect.height * 100;
+      if (Math.abs(ev.clientX - start.px) + Math.abs(ev.clientY - start.py) > 3) moved = true;
+      if (start.mode === "move") { it.x = clamp(start.x + dx, -5, 100 - 2); it.y = clamp(start.y + dy, -5, 100 - 2); }
+      else if (isColor) { it.w = clamp(start.w + dx, 4, 100); }
+      else { it.w = clamp(start.w + dx, 6, 110); it.h = clamp(start.h + dy, 6, 110); }
+      itEl.style.left = it.x + "%"; itEl.style.top = it.y + "%"; itEl.style.width = it.w + "%";
+      if (!isColor) itEl.style.height = it.h + "%";
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove); document.removeEventListener("pointerup", onUp);
+      if (moved) boardChanged(n, true);
+      else if (it.type === "image" && !it.src) { BRD.pendingFill = id; $("#mbFile").click(); }
+      else if (it.type === "text" && wasSel) editBoardText(it);
+    };
+    document.addEventListener("pointermove", onMove); document.addEventListener("pointerup", onUp);
+  });
+}
+function selectItem(id, silent) {
+  BRD.sel = id;
+  $$("#mbCanvas .mb-item").forEach((el) => el.classList.toggle("sel", el.dataset.it === id));
+  if (!silent) renderItemBar();
+}
+function renderItemBar() {
+  $("#mbItemBar")?.remove();
+  const n = S.notes.get(BRD.id); if (!BRD.sel) return;
+  const it = n.board.items.find((x) => x.id === BRD.sel); if (!it) return;
+  const bar = document.createElement("div"); bar.id = "mbItemBar"; bar.className = "mb-itembar";
+  const btn = (k, icn, lbl) => `<button class="mb-ib" data-mi="${k}" title="${lbl}" aria-label="${lbl}">${ic(icn)}</button>`;
+  let extra = "";
+  if (it.type === "image" && it.src) extra = btn("replace", "image", "Trocar foto");
+  if (it.type === "color") extra = `<button class="mb-ib" data-mi="recolor" title="Mudar cor"><span class="mb-bgdot" style="background:${esc(it.color)}"></span></button>`;
+  if (it.type === "text") extra = btn("edittext", "type", "Editar texto");
+  bar.innerHTML = extra + btn("front", "up", "Trazer pra frente") + btn("back", "down", "Mandar pra trás") + btn("dup", "dup", "Duplicar") + `<button class="mb-ib danger" data-mi="del" title="Excluir">${ic("trash")}</button>`;
+  $("#mbStage").appendChild(bar);
+  bar.addEventListener("click", (e) => { const b = e.target.closest("[data-mi]"); if (b) itemAction(b.dataset.mi, it); });
+}
+function itemAction(k, it) {
+  const n = S.notes.get(BRD.id);
+  if (k === "del") { n.board.items = n.board.items.filter((x) => x.id !== it.id); BRD.sel = null; $("#mbItemBar")?.remove(); boardChanged(n); return; }
+  if (k === "front") { it.z = Math.max(0, ...n.board.items.map((x) => x.z || 0)) + 1; boardChanged(n); return; }
+  if (k === "back") { it.z = Math.min(0, ...n.board.items.map((x) => x.z || 0)) - 1; boardChanged(n); return; }
+  if (k === "dup") { const c = { ...it, id: uid("mb_"), x: it.x + 3, y: it.y + 3, z: (it.z || 0) + 1 }; n.board.items.push(c); BRD.sel = c.id; boardChanged(n); return; }
+  if (k === "replace") { BRD.pendingFill = it.id; $("#mbFile").click(); return; }
+  if (k === "recolor") { pickColor(it.color, (col) => { it.color = col; boardChanged(n); }); return; }
+  if (k === "edittext") { editBoardText(it); return; }
+}
+function boardChanged(n, light) {
+  n.updated = Date.now();
+  n.text = "Moodboard" + (n.board.items.filter((i) => i.type === "text").map((i) => " · " + i.text).join(""));
+  markNote(n.id);
+  renderBoardItems(); renderItemBar();
+  if (!light) { renderList(false, true); }
+}
+
+/* ---------- adicionar itens ---------- */
+function boardImageFile(file) {
+  return new Promise((res, rej) => {
+    if (!file || !/^image\//.test(file.type)) return rej(new Error("tipo"));
+    const fr = new FileReader();
+    fr.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const max = 1200, k = Math.min(1, max / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * k)), h = Math.max(1, Math.round(img.height * k));
+        const c = document.createElement("canvas"); c.width = w; c.height = h;
+        c.getContext("2d").drawImage(img, 0, 0, w, h);
+        let src; try { src = c.toDataURL("image/jpeg", .82); } catch (e) { src = fr.result; }
+        res({ src, ratio: img.width / img.height });
+      };
+      img.onerror = rej; img.src = fr.result;
+    };
+    fr.onerror = rej; fr.readAsDataURL(file);
+  });
+}
+function mbAddImage() { BRD.pendingFill = null; $("#mbFile").click(); }
+async function mbFilePicked(file) {
+  const n = S.notes.get(BRD.id); if (!n || !file) return;
+  try {
+    const { src, ratio } = await boardImageFile(file);
+    if (BRD.pendingFill) { const it = n.board.items.find((x) => x.id === BRD.pendingFill); BRD.pendingFill = null; if (it) { it.src = src; boardChanged(n); return; } }
+    const w = 46, h = clamp(w / ((ratio || 1) * boardAspect()), 14, 82);
+    n.board.items.push({ id: uid("mb_"), type: "image", src, x: 27, y: 22, w, h, z: topZ(n) + 1, rad: 10 });
+    boardChanged(n);
+  } catch (e) { toast("Não consegui carregar essa imagem."); }
+}
+function mbAddText() {
+  const n = S.notes.get(BRD.id);
+  const it = { id: uid("mb_"), type: "text", text: "Texto", x: 20, y: 44, w: 60, h: 12, z: topZ(n) + 1, color: "#20151a", size: 6, font: "slab", weight: 700, align: "center", spacing: 0 };
+  n.board.items.push(it); BRD.sel = it.id; boardChanged(n); editBoardText(it);
+}
+function mbAddColor() {
+  const n = S.notes.get(BRD.id);
+  pickColor("#e9c7c0", (col) => { const it = { id: uid("mb_"), type: "color", color: col, x: 42, y: 42, w: 15, z: topZ(n) + 1, rad: 50 }; n.board.items.push(it); BRD.sel = it.id; boardChanged(n); });
+}
+function boardAspect() { const n = S.notes.get(BRD.id); return (n && n.board.ratio) || 1.25; }
+function topZ(n) { return Math.max(0, ...n.board.items.map((x) => x.z || 0)); }
+
+/* ---------- paleta automática ---------- */
+async function mbAutoPalette() {
+  const n = S.notes.get(BRD.id);
+  const imgs = n.board.items.filter((i) => i.type === "image" && i.src);
+  if (!imgs.length) { toast("Adicione fotos primeiro pra extrair as cores."); return; }
+  toast("Extraindo as cores das fotos…");
+  const colors = await extractColors(imgs.map((i) => i.src), 5);
+  if (!colors.length) { toast("Não consegui extrair cores agora."); return; }
+  const row = paletteRow(90, colors.length, colors);
+  const base = topZ(n);
+  row.forEach((r, i) => { r.z = base + 1 + i; n.board.items.push(r); });
+  boardChanged(n);
+  toast(plural(colors.length, "cor adicionada", "cores adicionadas"));
+}
+function extractColors(srcs, k) {
+  return new Promise((resolve) => {
+    const counts = new Map(); let pending = srcs.length;
+    const done = () => {
+      const arr = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+      const picked = [];
+      for (const [key] of arr) {
+        const [r, g, b] = key.split(",").map(Number);
+        if (picked.every((p) => Math.abs(p[0] - r) + Math.abs(p[1] - g) + Math.abs(p[2] - b) > 60)) picked.push([r, g, b]);
+        if (picked.length >= k) break;
+      }
+      resolve(picked.map(([r, g, b]) => "#" + [r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("")));
+    };
+    srcs.forEach((src) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const s = 32, c = document.createElement("canvas"); c.width = s; c.height = s;
+          const ctx = c.getContext("2d"); ctx.drawImage(img, 0, 0, s, s);
+          const d = ctx.getImageData(0, 0, s, s).data;
+          for (let i = 0; i < d.length; i += 4) {
+            const a = d[i + 3]; if (a < 128) continue;
+            const r = Math.round(d[i] / 24) * 24, g = Math.round(d[i + 1] / 24) * 24, bl = Math.round(d[i + 2] / 24) * 24;
+            const mx = Math.max(r, g, bl), mn = Math.min(r, g, bl);
+            if (mx > 240 && mn > 240) continue; // ignora branco puro
+            if (mx < 18) continue;              // ignora preto puro
+            const key = r + "," + g + "," + bl; counts.set(key, (counts.get(key) || 0) + 1);
+          }
+        } catch (e) {}
+        if (--pending === 0) done();
+      };
+      img.onerror = () => { if (--pending === 0) done(); };
+      img.src = src;
+    });
+  });
+}
+
+/* ---------- editar texto ---------- */
+function editBoardText(it) {
+  const n = S.notes.get(BRD.id);
+  const m = modal(`<div class="m-head"><div class="m-ic">${ic("type")}</div><h2>Texto</h2><button class="ib" id="txX" aria-label="Fechar">${ic("x")}</button></div>
+    <div class="m-body mb-txtedit">
+      <textarea class="field" id="txT" rows="2" placeholder="Escreva aqui">${esc(it.text || "")}</textarea>
+      <div class="mb-row"><label>Fonte<select class="field" id="txF">${BOARD_FONTS.map(([v, l]) => `<option value="${v}"${it.font === v ? " selected" : ""}>${l}</option>`).join("")}</select></label>
+        <label>Tamanho<select class="field" id="txS">${[3, 4, 5, 6, 8, 10, 12].map((s) => `<option value="${s}"${(it.size || 6) === s ? " selected" : ""}>${s === 3 ? "Pequeno" : s === 4 ? "Médio" : s === 6 ? "Grande" : s === 8 ? "Enorme" : s >= 10 ? "Gigante" : s}</option>`).join("")}</select></label></div>
+      <div class="mb-row"><label>Peso<select class="field" id="txW">${[["400", "Fina"], ["600", "Média"], ["700", "Negrito"], ["800", "Pesada"]].map(([v, l]) => `<option value="${v}"${String(it.weight || 600) === v ? " selected" : ""}>${l}</option>`).join("")}</select></label>
+        <label>Alinhar<div class="seg mb-seg" id="txA">${[["left", "Esq."], ["center", "Centro"], ["right", "Dir."]].map(([v, l]) => `<button type="button" data-a="${v}" class="${(it.align || "left") === v ? "on" : ""}">${l}</button>`).join("")}</div></label></div>
+      <div class="mb-row"><label>Cor<button class="btn" id="txC"><span class="mb-bgdot" style="background:${esc(it.color || "#20151a")}"></span>Escolher</button></label></div>
+    </div>`, { wide: false });
+  const upd = () => { boardChanged(n); };
+  $("#txT", m).oninput = (e) => { it.text = e.target.value; upd(); };
+  $("#txF", m).onchange = (e) => { it.font = e.target.value; upd(); };
+  $("#txS", m).onchange = (e) => { it.size = +e.target.value; upd(); };
+  $("#txW", m).onchange = (e) => { it.weight = +e.target.value; upd(); };
+  $("#txA", m).addEventListener("click", (e) => { const b = e.target.closest("[data-a]"); if (!b) return; it.align = b.dataset.a; $$("#txA button", m).forEach((x) => x.classList.toggle("on", x === b)); upd(); });
+  $("#txC", m).onclick = () => pickColor(it.color || "#20151a", (col) => { it.color = col; $("#txC .mb-bgdot", m).style.background = col; upd(); });
+  $("#txX", m).onclick = () => m.close();
+  setTimeout(() => { const t = $("#txT", m); if (t) { t.focus(); t.select(); } }, 60);
+}
+
+/* ---------- seletor de cor ---------- */
+const MB_SWATCHES = ["#20151a", "#ffffff", "#f6d5cf", "#e9a7a0", "#d46a7e", "#c0304f", "#b8142e", "#7a1f2b", "#e8c9a0", "#c99a6a", "#a7703f", "#5a3a28", "#f3e7df", "#cdb4a0", "#9a8b7a", "#2b2b2b"];
+function pickColor(cur, cb) {
+  const m = modal(`<div class="m-head"><div class="m-ic">${ic("palette")}</div><h2>Escolher cor</h2><button class="ib" id="pcX" aria-label="Fechar">${ic("x")}</button></div>
+    <div class="m-body"><div class="mb-swatches">${MB_SWATCHES.map((c) => `<button class="mb-sw${c.toLowerCase() === (cur || "").toLowerCase() ? " on" : ""}" data-c="${c}" style="background:${c}" aria-label="${c}"></button>`).join("")}</div>
+      <label class="mb-custom">Personalizada<input type="color" id="pcCustom" value="${/^#[0-9a-f]{6}$/i.test(cur || "") ? cur : "#e9c7c0"}"></label></div>`, { wide: false });
+  const choose = (c) => { m.close(); cb(c); };
+  m.addEventListener("click", (e) => { if (e.target.closest("#pcX")) return m.close(); const b = e.target.closest("[data-c]"); if (b) choose(b.dataset.c); });
+  $("#pcCustom", m).oninput = (e) => { $$(".mb-sw", m).forEach((x) => x.classList.remove("on")); };
+  $("#pcCustom", m).onchange = (e) => choose(e.target.value);
+}
+
+/* ---------- fundo do board ---------- */
+function mbBackground() { const n = S.notes.get(BRD.id); pickColor(n.board.bg, (col) => { n.board.bg = col; n.updated = Date.now(); markNote(n.id); const cv = $("#mbCanvas"); if (cv) cv.style.background = col; const d = $(".mb-bgdot", $("#mbTools")); if (d) d.style.background = col; }); }
+
+/* ---------- wiring da toolbar ---------- */
+function mbToolbarClick(k) {
+  if (k === "addimg") return mbAddImage();
+  if (k === "addtext") return mbAddText();
+  if (k === "addcolor") return mbAddColor();
+  if (k === "palette") return mbAutoPalette();
+  if (k === "bg") return mbBackground();
+  if (k === "export") return exportBoard();
+}
+
+/* ---------- exportar como imagem ---------- */
+async function exportBoard() {
+  const n = S.notes.get(BRD.id); if (!n) return;
+  toast("Gerando a imagem…");
+  try { await document.fonts.ready; } catch (e) {}
+  const b = n.board, W = 1200, H = Math.round(W * (b.ratio || 1.25));
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = b.bg || "#faf6f4"; ctx.fillRect(0, 0, W, H);
+  const its = [...(b.items || [])].sort((a, b2) => (a.z || 0) - (b2.z || 0));
+  const loadImg = (src) => new Promise((res) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = src; });
+  for (const it of its) {
+    const x = it.x / 100 * W, y = it.y / 100 * H, w = it.w / 100 * W, h = it.type === "color" ? it.w / 100 * W : it.h / 100 * H;
+    if (it.type === "image" && it.src) {
+      const img = await loadImg(it.src); if (!img) continue;
+      ctx.save(); roundRect(ctx, x, y, w, h, (it.rad || 10) / 100 * W); ctx.clip();
+      const ir = img.width / img.height, br = w / h; let sw = img.width, sh = img.height, sx = 0, sy = 0;
+      if (ir > br) { sw = img.height * br; sx = (img.width - sw) / 2; } else { sh = img.width / br; sy = (img.height - sh) / 2; }
+      ctx.drawImage(img, sx, sy, sw, sh, x, y, w, h); ctx.restore();
+    } else if (it.type === "color") {
+      ctx.save(); const r = (it.rad != null ? it.rad : 50) >= 50 ? Math.min(w, h) / 2 : (it.rad || 0) / 100 * W; roundRect(ctx, x, y, w, h, r); ctx.fillStyle = it.color || "#ccc"; ctx.fill(); ctx.restore();
+    } else if (it.type === "text") {
+      const fs = (it.size || 6) / 100 * W;
+      ctx.fillStyle = it.color || "#20151a"; ctx.textBaseline = "top";
+      ctx.font = `${it.weight || 600} ${fs}px ${boardFontCss(it.font).replace(/var\(--ui\)/, "system-ui")}`;
+      const align = it.align || "left"; ctx.textAlign = align;
+      const tx = align === "center" ? x + w / 2 : align === "right" ? x + w : x;
+      const lh = fs * 1.18, lines = wrapLines(ctx, it.text || "", w);
+      let ty = y + Math.max(0, (h - lines.length * lh) / 2);
+      lines.forEach((ln) => { ctx.fillText(ln, tx, ty); ty += lh; });
+    }
+  }
+  c.toBlob((blob) => {
+    if (!blob) { toast("Não consegui gerar a imagem."); return; }
+    const url = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = url; a.download = (titleOf(n).replace(/[^\w\s-]/g, "").trim() || "moodboard") + ".png";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    toast("Imagem exportada ✨");
+  }, "image/png");
+}
+function roundRect(ctx, x, y, w, h, r) { r = Math.min(r, w / 2, h / 2); ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+function wrapLines(ctx, text, maxW) {
+  const out = [];
+  String(text).split("\n").forEach((para) => {
+    const words = para.split(/\s+/).filter(Boolean); let line = "";
+    if (!words.length) { out.push(""); return; }
+    for (const w of words) { const test = line ? line + " " + w : w; if (ctx.measureText(test).width > maxW && line) { out.push(line); line = w; } else line = test; }
+    if (line) out.push(line);
+  });
+  return out;
+}
+
+/* ---------- miniatura/snippet pra lista ---------- */
+function boardThumb(n) { const it = (n.board && n.board.items || []).filter((i) => i.type === "image" && i.src).sort((a, b) => (a.z || 0) - (b.z || 0))[0]; return it ? it.src : null; }
+function boardCount(n) { const its = (n.board && n.board.items) || []; const ph = its.filter((i) => i.type === "image" && i.src).length; return ph; }
 
 async function init() {
   const d = await api.load();

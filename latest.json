@@ -1,4 +1,4 @@
 {
-  "version": "2.6.0",
-  "notes": "Sincronização com a nuvem chegou ao PC! Entre com uma conta (Configurações › Sincronizar) e suas notas ficam iguais no PC e no celular.\nLogin com olhinho para ver a senha.\nAtualização automática entre aparelhos, sem recarregar."
+  "version": "2.7.0",
+  "notes": "Novidade: Moodboards! Crie painéis visuais com fotos, paleta de cores e textos.\nGrades prontas (2x2, 3x3, fotos + paleta e mais) ou comece do zero e arraste tudo livremente.\nPaleta automática a partir das fotos, ou escolha as cores na mão.\nExporte o moodboard como imagem.\nFunciona no PC e no celular, com toque e mouse."
 }
