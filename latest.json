@@ -1,4 +1,4 @@
 {
-  "version": "2.7.0",
-  "notes": "Novidade: Moodboards! Crie painéis visuais com fotos, paleta de cores e textos.\nGrades prontas (2x2, 3x3, fotos + paleta e mais) ou comece do zero e arraste tudo livremente.\nPaleta automática a partir das fotos, ou escolha as cores na mão.\nExporte o moodboard como imagem.\nFunciona no PC e no celular, com toque e mouse."
+  "version": "2.7.1",
+  "notes": "Novidade: Moodboards! Paineis visuais com fotos, paleta de cores e textos — crie pelo botao + da lista de notas (grades prontas ou em branco, arraste tudo, paleta automatica das fotos e exportar como imagem).\nSincronizacao mais robusta: o que voce editar sem internet agora sobe sozinho assim que a conexao volta."
 }

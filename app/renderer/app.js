@@ -606,9 +606,9 @@ async function cloudInit() {
     });
     if (CLOUD.user) cloudOnLogin();
     /* ao voltar pro app, busca as novidades na hora (sem esperar o poll) */
-    document.addEventListener("visibilitychange", () => { if (!document.hidden && CLOUD.user) cloudPullChanges(); });
-    addEventListener("focus", () => { if (CLOUD.user) cloudPullChanges(); });
-    addEventListener("online", () => { if (CLOUD.user) cloudPullChanges(); });
+    document.addEventListener("visibilitychange", () => { if (!document.hidden && CLOUD.user) { cloudFlushPending(); cloudPullChanges(); } });
+    addEventListener("focus", () => { if (CLOUD.user) { cloudFlushPending(); cloudPullChanges(); } });
+    addEventListener("online", () => { if (CLOUD.user) { cloudFlushPending(); cloudPullChanges(); } });
   } catch (e) { console.warn("cloudInit", e); }
   refreshSyncUI();
 }
@@ -643,6 +643,7 @@ async function cloudOnLogin() {
     if (!rnb || localNbUpd >= (rnb.updated || 0)) await cloudPushNotebooks();
     let maxU = 0; rnotes.forEach((r) => { if ((r.updated || 0) > maxU) maxU = r.updated; });
     CLOUD.lastPull = Math.max(maxU, rnb ? (rnb.updated || 0) : 0);
+    if (CLOUD.pend) CLOUD.pend.clear(); if (CLOUD.pendDel) CLOUD.pendDel.clear(); CLOUD.pendNb = false;
     saveLocalAll(); renderAll(true); cloudSubscribe(); cloudStartPoll();
     CLOUD.state = "ok";
   } catch (e) { console.warn("cloudOnLogin", e); CLOUD.state = "err"; }
@@ -650,7 +651,7 @@ async function cloudOnLogin() {
 }
 /* busca incremental: só o que mudou desde a última vez (barato) */
 async function cloudPullChanges() {
-  if (!SB || !CLOUD.user) return;
+  if (!SB || !CLOUD.user || navigator.onLine === false) return;
   try {
     const since = Math.max(0, (CLOUD.lastPull || 0) - 10000);
     const [nr, br] = await Promise.all([
@@ -669,7 +670,7 @@ async function cloudPullChanges() {
   } catch (e) {}
 }
 let pollTimer = null;
-function cloudStartPoll() { cloudStopPoll(); pollTimer = setInterval(() => { if (!document.hidden && CLOUD.user) cloudPullChanges(); }, 4000); }
+function cloudStartPoll() { cloudStopPoll(); pollTimer = setInterval(() => { if (!document.hidden && CLOUD.user) { if (cloudHasPending()) cloudFlushPending(); cloudPullChanges(); } }, 4000); }
 function cloudStopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 async function cloudPushNotes(notes) {
   if (!SB || !CLOUD.user || !notes.length) return;
@@ -688,19 +689,42 @@ async function cloudPushNotebooks() {
   const { error } = await SB.from("notebooks").upsert({ user_id: CLOUD.user.id, list: [...S.nbs.values()], updated: S.nbUpdated }, { onConflict: "user_id" });
   if (error) throw error;
 }
+function cloudMarkPending(ids, dels, nb) {
+  CLOUD.pend = CLOUD.pend || new Set(); CLOUD.pendDel = CLOUD.pendDel || new Set();
+  (ids || []).forEach((i) => CLOUD.pend.add(i));
+  (dels || []).forEach((i) => { CLOUD.pendDel.add(i); CLOUD.pend.delete(i); });
+  if (nb) CLOUD.pendNb = true;
+}
+function cloudHasPending() { return !!((CLOUD.pend && CLOUD.pend.size) || (CLOUD.pendDel && CLOUD.pendDel.size) || CLOUD.pendNb); }
 function cloudSync(ids, dels, nb) {
   if (!SB || !CLOUD.user) return;
   (async () => {
     try {
+      if (navigator.onLine === false) throw new Error("offline");
       CLOUD.state = "syncing"; refreshSyncUI();
       const notes = ids.map((id) => S.notes.get(id)).filter(Boolean);
       if (notes.length) await cloudPushNotes(notes);
       if (dels && dels.length) await cloudDeleteNotes(dels);
       if (nb) await cloudPushNotebooks();
       CLOUD.state = "ok";
-    } catch (e) { console.warn("cloudSync", e); CLOUD.state = "err"; }
+    } catch (e) { console.warn("cloudSync", e); cloudMarkPending(ids, dels, nb); CLOUD.state = "err"; }
     refreshSyncUI();
   })();
+}
+/* reenvia o que ficou pendente (ex.: editado offline) quando a internet volta */
+async function cloudFlushPending() {
+  if (!SB || !CLOUD.user || !cloudHasPending() || navigator.onLine === false) return;
+  const ids = [...(CLOUD.pend || [])], dels = [...(CLOUD.pendDel || [])], nb = CLOUD.pendNb;
+  try {
+    CLOUD.state = "syncing"; refreshSyncUI();
+    const notes = ids.map((id) => S.notes.get(id)).filter(Boolean);
+    if (notes.length) await cloudPushNotes(notes);
+    if (dels.length) await cloudDeleteNotes(dels);
+    if (nb) await cloudPushNotebooks();
+    if (CLOUD.pend) CLOUD.pend.clear(); if (CLOUD.pendDel) CLOUD.pendDel.clear(); CLOUD.pendNb = false;
+    CLOUD.state = "ok";
+  } catch (e) { console.warn("cloudFlushPending", e); CLOUD.state = "err"; }
+  refreshSyncUI();
 }
 async function cloudSubscribe() {
   if (!SB || !CLOUD.user || CLOUD.sub) return;
