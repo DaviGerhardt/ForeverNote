@@ -1144,7 +1144,10 @@ function renderList(animate, noAnim) {
       <span class="s">${hl(snippet(n)) || '<i style="opacity:.6">Nota vazia</i>'}</span><span class="m">${meta}</span></div>
       ${img ? (WEB && anexoName(img) ? `<img class="thumb img-wait" src="${IMG_BLANK}" data-anexo="${esc(anexoName(img))}" alt="">` : `<img class="thumb" src="${esc(img)}" alt="" loading="lazy">`) : ""}</button>`;
   }).join("");
+  const oldThumbs = new Map();
+  box.querySelectorAll(".card[data-note] .thumb").forEach((im) => oldThumbs.set(im.closest(".card").dataset.note + "|" + imgKey(im), im));
   box.innerHTML = h;
+  box.querySelectorAll(".card[data-note] .thumb").forEach((im) => { const o = oldThumbs.get(im.closest(".card").dataset.note + "|" + imgKey(im)); if (o && o !== im && !o.classList.contains("img-wait")) im.replaceWith(o); });
   if (WEB) hydrateImgs(box);
   $("#list").classList.toggle("picking", S.pickMode || S.picked.size > 0);
   renderBulk();
@@ -1246,6 +1249,7 @@ function renderPane(opts = {}) {
   }
   const nb = S.nbs.get(n.nb);
   if (n.kind === "moodboard") { ED = null; renderBoard(n, opts); return; }
+  const keepNodes = ED && ED.id === n.id && ED.doc && ED.doc.isConnected ? harvestNodes(ED.doc) : null;
   pane.innerHTML = `
     <div class="ed-top">
       <button class="ib mob-back" data-act="mobback" aria-label="Voltar para a lista">${ic("left")}</button>
@@ -1276,6 +1280,7 @@ function renderPane(opts = {}) {
   stopAudio(); closeReview(true);
   if (n.boards) { const used = new Set([...(n.html || "").matchAll(/data-board="([^"]+)"/g)].map((m) => m[1])); Object.keys(n.boards).forEach((k) => { if (!used.has(k)) delete n.boards[k]; }); if (!Object.keys(n.boards).length) delete n.boards; }
   doc.innerHTML = webImgHTML(n.html || "");
+  if (keepNodes) reuseNodes(doc, keepNodes, n);
   doc.querySelectorAll("[data-state]").forEach((x) => x.removeAttribute("data-state"));
   doc.querySelectorAll(".audio-block").forEach((x) => { x.contentEditable = "false"; });
   refreshNoteLinks(doc);
@@ -5259,11 +5264,13 @@ function hydrateEmbeds(root, only) {
     }
     if (b && seen.has(bid)) { const nb = uid("bd_"); n.boards[nb] = snap(mbMigrate(b)); b = n.boards[nb]; bid = nb; el.setAttribute("data-board", nb); changed = true; }
     seen.add(bid);
+    if (b && el._sig && el._sig === boardSig(b) && el.querySelector(".mbe-canvas")) return;
     if (!b) { el.innerHTML = `<div class="mbe-miss">${ic("board")}<span>Este moodboard não está mais disponível.</span><button class="mbe-btn" data-mbe="remove">${ic("trash")}Remover</button></div>`; return; }
     const ro = ED.doc.contentEditable !== "true", cnt = b.items.filter((i) => i.type === "image" && i.src).length;
     el.innerHTML = `<div class="mbe-view" title="${ro ? "" : "Clique para editar"}">${boardStaticHTML(b)}</div>
       <div class="mbe-bar"><span class="mbe-tag">${ic("board")}<b>${esc((b.title || "").trim() || "Moodboard")}</b>${cnt ? `<i>${plural(cnt, "foto", "fotos")}</i>` : ""}</span><span class="grow"></span>
         ${ro ? "" : `<button class="mbe-btn" data-mbe="edit">${ic("edit")}<span>Editar</span></button>`}<button class="mbe-btn ic" data-mbe="more" title="Mais opções" aria-label="Mais opções">${ic("more")}</button></div>`;
+    el._sig = boardSig(b);
   });
   if (changed) { n.updated = Date.now(); markNote(n.id); }
 }
@@ -5373,6 +5380,32 @@ function closeBoardSheet(fromPop) {
   }
 }
 
+/* evitar piscadas: reaproveita imagens e blocos já desenhados quando a mesma nota é redesenhada */
+const imgKey = (im) => im.getAttribute("data-anexo") || anexoName(im.getAttribute("src")) || im.getAttribute("src") || "";
+function boardSig(b) {
+  const its = (b && b.items) || [];
+  return (b.bg || "") + "|" + (b.ratio || "") + "|" + (b.hex ? 1 : 0) + "|" + (b.title || "") + "|" + its.map((i) => [i.id, i.type, i.x, i.y, i.w, i.h, i.z, i.rad, i.color, i.text, i.size, i.font, i.weight, i.italic, i.caps, i.ls, i.align, i.fx, i.fy, i.zoom, i.ia, i.src ? i.src.length + i.src.slice(-24) : ""].join(",")).join(";");
+}
+function harvestNodes(doc) {
+  const imgs = new Map(), embeds = new Map();
+  doc.querySelectorAll("img").forEach((im) => { if (im.closest(".mb-embed") || im.classList.contains("img-wait") || !im.complete || !im.naturalWidth) return; const k = imgKey(im); if (!k) return; if (!imgs.has(k)) imgs.set(k, []); imgs.get(k).push(im); });
+  doc.querySelectorAll(".mb-embed").forEach((e) => { const bid = e.getAttribute("data-board"); if (bid && e._sig) embeds.set(bid, e); });
+  return { imgs, embeds };
+}
+function reuseNodes(doc, keep, n) {
+  doc.querySelectorAll("img").forEach((im) => {
+    if (im.closest(".mb-embed")) return;
+    const list = keep.imgs.get(imgKey(im)); const old = list && list.shift(); if (!old) return;
+    [...old.attributes].forEach((a) => { if (a.name !== "src" && a.name !== "data-anexo" && !im.hasAttribute(a.name)) old.removeAttribute(a.name); });
+    [...im.attributes].forEach((a) => { if (a.name !== "src" && a.name !== "data-anexo") old.setAttribute(a.name, a.value); });
+    old.classList.remove("selected", "img-wait", "img-miss");
+    im.replaceWith(old);
+  });
+  doc.querySelectorAll(".mb-embed").forEach((e) => {
+    const bid = e.getAttribute("data-board"), old = keep.embeds.get(bid), b = n.boards && n.boards[bid];
+    if (old && b && old._sig === boardSig(b)) { keep.embeds.delete(bid); e.replaceWith(old); }
+  });
+}
 /* sempre existe uma linha para escrever depois de imagens, moodboards, divisores e áudios */
 function isTextBlock(el) {
   if (!el || el.nodeType !== 1) return false;
