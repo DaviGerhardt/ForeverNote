@@ -50,5 +50,7 @@ contextBridge.exposeInMainWorld("api", {
   onUpdateAvailable: (cb) => ipcRenderer.on("update:available", (e, v) => cb(v)),
   onUpdateProgress: (cb) => ipcRenderer.on("update:progress", (e, v) => cb(v)),
   imageData: (name) => inv("image:dataurl", name),
+  cloudCreds: (c) => ipcRenderer.send("cloud:creds", c),
+  clipboardImages: () => inv("clipboard:images"),
   appVersion: () => { try { return ipcRenderer.sendSync("app:version"); } catch (e) { return ""; } }
 });

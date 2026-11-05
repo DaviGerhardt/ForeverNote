@@ -297,15 +297,75 @@ ipcMain.handle("folder:open", (e, which) => {
   return shell.openPath(p);
 });
 ipcMain.handle("link:open", (e, url) => openExternal(url));
+/* ---------------- imagens na nuvem ---------------- */
+let CLOUD_CREDS = null;
+ipcMain.on("cloud:creds", (e, c) => { CLOUD_CREDS = c && c.token && c.uid && (/^https:\/\//.test(c.url || "") || (!app.isPackaged && /^http:\/\/127\.0\.0\.1:\d+$/.test(c.url || ""))) ? c : null; });
+const IMG_TYPES = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", bmp: "image/bmp" };
+const IMG_INFLIGHT = new Map();
+function cloudImage(name) {
+  name = path.basename(String(name || ""));
+  if (!CLOUD_CREDS || !/^[\w.-]+$/.test(name) || !IMG_TYPES[path.extname(name).slice(1).toLowerCase()]) return Promise.resolve(null);
+  if (IMG_INFLIGHT.has(name)) return IMG_INFLIGHT.get(name);
+  const p = (async () => {
+    try {
+      const c = CLOUD_CREDS;
+      const r = await net.fetch(`${c.url}/storage/v1/object/authenticated/imagens/${encodeURIComponent(c.uid)}/${encodeURIComponent(name)}`, { headers: { Authorization: "Bearer " + c.token, apikey: c.key } });
+      if (!r.ok) return null;
+      const buf = Buffer.from(await r.arrayBuffer()); if (!buf.length) return null;
+      fs.mkdirSync(D.images(), { recursive: true });
+      const dest = path.join(D.images(), name), tmp = dest + ".part";
+      await fs.promises.writeFile(tmp, buf); await fs.promises.rename(tmp, dest);
+      return buf;
+    } catch (err) { return null; }
+  })();
+  IMG_INFLIGHT.set(name, p); p.finally(() => IMG_INFLIGHT.delete(name));
+  return p;
+}
+async function readImage(name) {
+  const file = path.join(D.images(), path.basename(String(name || "")));
+  try { return await fs.promises.readFile(file); } catch (e) { return await cloudImage(name); }
+}
 ipcMain.handle("image:dataurl", async (e, name) => {
   try {
-    const file = path.join(D.images(), path.basename(String(name || "")));
-    const ext = path.extname(file).slice(1).toLowerCase();
-    const type = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" }[ext];
+    const type = IMG_TYPES[path.extname(String(name || "")).slice(1).toLowerCase()];
     if (!type) return null;
-    const buf = await fs.promises.readFile(file);
+    const buf = await readImage(name); if (!buf) return null;
     return "data:" + type + ";base64," + buf.toString("base64");
   } catch (err) { return null; }
+});
+/* colar: arquivos de imagem copiados numa pasta do Windows (um ou vários) e imagem pura */
+async function clipboardFilePaths() {
+  const { clipboard } = require("electron");
+  let paths = [];
+  if (process.platform === "win32") {
+    let single = "";
+    try { const b = clipboard.readBuffer("FileNameW"); if (b && b.length) single = b.toString("ucs2").replace(/\0[\s\S]*$/, ""); } catch (e) {}
+    try {
+      const out = await new Promise((res) => require("child_process").execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-Command", "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }"], { encoding: "utf8", windowsHide: true, timeout: 5000 }, (err, so) => res(err ? "" : so || "")));
+      paths = out.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+    } catch (e) {}
+    if (!paths.length && single) paths = [single];
+  } else if (process.platform === "darwin") {
+    try { const u = clipboard.read("public.file-url"); if (u) paths = [decodeURIComponent(u.replace(/^file:\/\//, ""))]; } catch (e) {}
+  } else {
+    try { const t = clipboard.read("text/uri-list") || ""; paths = t.split(/\r?\n/).filter((x) => x.startsWith("file://")).map((x) => decodeURIComponent(x.slice(7))); } catch (e) {}
+  }
+  return paths;
+}
+ipcMain.handle("clipboard:images", async () => {
+  const out = [];
+  try {
+    for (const p of (await clipboardFilePaths()).slice(0, 30)) {
+      const ext = path.extname(p).slice(1).toLowerCase(), type = IMG_TYPES[ext]; if (!type) continue;
+      try { const st = await fs.promises.stat(p); if (!st.isFile() || st.size > 40 * 1024 * 1024) continue; const buf = await fs.promises.readFile(p); out.push({ name: path.basename(p), type, data: "data:" + type + ";base64," + buf.toString("base64") }); } catch (e) {}
+    }
+    if (!out.length) {
+      const { clipboard } = require("electron");
+      const im = clipboard.readImage();
+      if (im && !im.isEmpty()) out.push({ name: "imagem.png", type: "image/png", data: im.toDataURL() });
+    }
+  } catch (e) {}
+  return out;
 });
 ipcMain.handle("win:fullscreen", (e, on) => { if (win) win.setFullScreen(!!on); return win ? win.isFullScreen() : false; });
 ipcMain.handle("win:reload", (e) => { e.sender.reload(); return true; });
@@ -733,12 +793,17 @@ app.whenReady().then(() => {
   protocol.handle("anexo", async (req) => {
     const u = new URL(req.url);
     const file = path.join(D.images(), path.basename(decodeURIComponent(u.pathname)));
+    const ext = path.extname(file).slice(1).toLowerCase();
+    const type = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", webm: "audio/webm", ogg: "audio/ogg", wav: "audio/wav", m4a: "audio/mp4" }[ext] || "application/octet-stream";
     try {
       const buf = await fs.promises.readFile(file);
-      const ext = path.extname(file).slice(1).toLowerCase();
-      const type = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", webm: "audio/webm", ogg: "audio/ogg", wav: "audio/wav", m4a: "audio/mp4" }[ext] || "application/octet-stream";
       return new Response(buf, { headers: { "content-type": type } });
-    } catch (e) { return new Response("", { status: 404 }); }
+    } catch (e) {
+      // imagem colocada pelo celular: baixa da nuvem na hora e guarda na pasta
+      const buf = u.hostname === "img" ? await cloudImage(path.basename(file)) : null;
+      if (buf) return new Response(buf, { headers: { "content-type": type } });
+      return new Response("", { status: 404 });
+    }
   });
   nativeTheme.on("updated", () => { if (win && !win.isDestroyed()) { try { win.setTitleBarOverlay(overlay()); win.setBackgroundColor(overlay().color); } catch (e) {} } });
   dailyBackup();

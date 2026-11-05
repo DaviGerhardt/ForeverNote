@@ -9,6 +9,8 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const uid = (p) => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const ic = (n, cls = "") => `<svg class="i ${cls}" aria-hidden="true"><use href="#i-${n}"/></svg>`;
+const INERT = document.implementation.createHTMLDocument("");
+const inertDiv = (html) => { const d = INERT.createElement("div"); if (html != null) d.innerHTML = html; return d; };
 const plural = (n, a, b) => `${n} ${n === 1 ? a : b}`;
 const norm = (s) => String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
@@ -38,7 +40,7 @@ const api = window.api || (() => {
     async saveNotebooks(l) { const d = get(); d.notebooks = l; put(d); },
     async saveSession(s) { const d = get(); d.session = s; put(d); },
     async savePrefs(p) { const d = get(); d.prefs = p; put(d); },
-    async saveImage(dataUrl) { return dataUrl; },
+    async saveImage(dataUrl) { return webSaveImage(dataUrl); },
     async saveAudio(buf) { return URL.createObjectURL(new Blob([buf], { type: "audio/webm" })); },
     async chooseFolder() { return null; }, async openFolder() {}, async openLink(u) { window.open(u, "_blank"); },
     async setFullscreen(on) { try { on ? await document.documentElement.requestFullscreen() : await document.exitFullscreen(); } catch (e) {} return on; },
@@ -204,7 +206,7 @@ const TEMPLATES = [
 const myTemplates = () => (Array.isArray(S.prefs.templates) ? S.prefs.templates : []);
 function htmlText(html) {
   const d = document.createElement("div"); d.style.cssText = "position:fixed;left:-9999px;top:0;width:600px;white-space:pre-wrap";
-  d.innerHTML = html; document.body.appendChild(d); const t = d.innerText; d.remove(); return t.replace(/ /g, " ");
+  d.innerHTML = webImgHTML(html); document.body.appendChild(d); const t = d.innerText; d.remove(); return t.replace(/ /g, " ");
 }
 function noteFromTemplate(t) {
   const extra = { title: t.title || "", html: t.html || "", text: htmlText(t.html || "") };
@@ -219,7 +221,7 @@ function applyTemplate(t) {
   const n = ED && S.notes.get(ED.id); if (!n || n.trashed) return;
   const empty = !(ED.doc.innerText || "").trim() && !ED.doc.querySelector("img,.audio-block,table,hr");
   if (empty) {
-    ED.doc.innerHTML = t.html;
+    ED.doc.innerHTML = webImgHTML(t.html); hydrateEmbeds(ED.doc); hydrateImgs(ED.doc); ensureTrail(ED.doc);
     mergeTplMeta(n, t);
     onDocChange(); renderFoot();
     const f = ED.doc.querySelector("[data-ph]"); if (f) caretStart(f);
@@ -280,7 +282,7 @@ async function saveAsTemplate(id = S.active) {
   const n = S.notes.get(id); if (!n) return;
   const v = await ask({ title: "Salvar como modelo", icon: "template", text: "O conteúdo desta nota vira um modelo, com a formatação e a etapa. O título não entra.", input: "Nome do modelo", value: (n.title || "").trim(), ok: "Salvar modelo" });
   const name = (typeof v === "string" ? v : "").trim(); if (!name) return;
-  const html = ED && ED.id === n.id ? ED.doc.innerHTML : n.html || "";
+  const html = ED && ED.id === n.id ? docHTML() : n.html || "";
   const tid = uid("tp_");
   S.prefs.templates = [...myTemplates(), { id: tid, name, title: "", html, stage: n.stage || "", tags: [...(n.tags || [])], nb: "", desc: "", created: Date.now() }];
   savePrefs(); renderSidebar();
@@ -407,7 +409,7 @@ function startTplEdit(id, isNew) {
 let tplSyncT = 0;
 function syncTpl(n) {
   const t = myTemplates().find((x) => x.id === n.tplEdit); if (!t) return;
-  t.html = ED && ED.id === n.id ? ED.doc.innerHTML : n.html;
+  t.html = ED && ED.id === n.id ? docHTML() : n.html;
   t.name = (n.title || "").trim() || "Modelo sem nome";
   t.tags = [...(n.tags || [])]; t.stage = n.stage || ""; t.prio = n.prio || 0;
   clearTimeout(tplSyncT); tplSyncT = setTimeout(() => savePrefs(), 400);
@@ -598,7 +600,9 @@ async function cloudInit() {
   try {
     const { data } = await SB.auth.getSession();
     CLOUD.user = data && data.session ? data.session.user : null;
+    sendCloudCreds(data && data.session);
     SB.auth.onAuthStateChange((_ev, session) => {
+      sendCloudCreds(session);
       const had = !!CLOUD.user; CLOUD.user = session ? session.user : null;
       if (CLOUD.user && !had) cloudOnLogin();
       else if (!CLOUD.user && had) cloudOnLogout();
@@ -608,7 +612,7 @@ async function cloudInit() {
     /* ao voltar pro app, busca as novidades na hora (sem esperar o poll) */
     document.addEventListener("visibilitychange", () => { if (!document.hidden && CLOUD.user) { cloudFlushPending(); cloudPullChanges(); } });
     addEventListener("focus", () => { if (CLOUD.user) { cloudFlushPending(); cloudPullChanges(); } });
-    addEventListener("online", () => { if (CLOUD.user) { cloudFlushPending(); cloudPullChanges(); } });
+    addEventListener("online", () => { if (CLOUD.user) { cloudFlushPending(); cloudPullChanges(); imgSyncSoon(600); setTimeout(retryMissingImgs, 1500); } });
   } catch (e) { console.warn("cloudInit", e); }
   refreshSyncUI();
 }
@@ -650,6 +654,7 @@ async function cloudOnLogin() {
     CLOUD.lastPull = Math.max(maxU, rnb ? (rnb.updated || 0) : 0);
     if (CLOUD.pend) CLOUD.pend.clear(); if (CLOUD.pendDel) CLOUD.pendDel.clear(); CLOUD.pendNb = false;
     saveLocalAll(); renderAll(true); cloudSubscribe(); cloudStartPoll();
+    imgSyncSoon(1500); setTimeout(retryMissingImgs, 2500);
     CLOUD.state = "ok";
   } catch (e) { console.warn("cloudOnLogin", e); CLOUD.state = "err"; }
   refreshSyncUI();
@@ -765,10 +770,9 @@ function applyRemoteNote(r) {
   const isOpen = (ED && ED.id === r.id) || boardOpen;
   if (ED && ED.id === r.id && editorBusy()) return false;
   if (boardOpen && boardBusy(r.id)) return false;
-  if (boardOpen) HIST.delete(r.id);
   const loc = S.notes.get(r.id);
   if (r.deleted) { if (loc) { S.notes.delete(r.id); if (isOpen) pendingOpenChanged = true; return true; } return false; }
-  if (!loc || (r.updated || 0) > (loc.updated || 0)) { const n = { ...r.data, id: r.id }; n.tags = n.tags || []; S.notes.set(r.id, n); if (isOpen) pendingOpenChanged = true; return true; }
+  if (!loc || (r.updated || 0) > (loc.updated || 0)) { const n = { ...r.data, id: r.id }; n.tags = n.tags || []; S.notes.set(r.id, n); if (isOpen) pendingOpenChanged = true; if (boardOpen) BRD.remote = true; return true; }
   return false;
 }
 let afterRemoteT = 0;
@@ -777,10 +781,13 @@ function afterRemote() {
   afterRemoteT = setTimeout(() => {
     saveLocalAll();
     const oc = pendingOpenChanged; pendingOpenChanged = false;
+    if (BRD && BRD.remote) { BRD.remote = false; mbRemoteStep(); }
+    if (BRD && BRD.bid && oc) { if (!mbBoard()) { closeBoardSheet(); toast("Este moodboard foi removido em outro aparelho"); } else { syncBoard({ quiet: true }); updUndoBtns(); showCtx(); } }
     if (ED && !S.notes.has(ED.id)) { const i = S.tabs.indexOf(ED.id); if (i >= 0) S.tabs.splice(i, 1); S.active = S.tabs.find((t) => S.notes.has(t)) || null; renderTabs(); renderPane(); }
     else if (oc && ED) { renderPane({ keepScroll: $("#edScroll") ? $("#edScroll").scrollTop : 0 }); }
     else if (oc && BRD && S.active === BRD.id) { const st = $("#mbStage"), sl = st ? [st.scrollLeft, st.scrollTop] : null; if (S.notes.has(BRD.id)) renderPane(); else { const i = S.tabs.indexOf(BRD.id); if (i >= 0) S.tabs.splice(i, 1); S.active = S.tabs.find((t) => S.notes.has(t)) || null; renderTabs(); renderPane(); } const st2 = $("#mbStage"); if (st2 && sl) { st2.scrollLeft = sl[0]; st2.scrollTop = sl[1]; } }
     renderSidebar(); renderList(false, true);
+    if (WEB) retryMissingImgs();
   }, 150);
 }
 function saveLocalAll() {
@@ -1135,9 +1142,10 @@ function renderList(animate, noAnim) {
     return `<button class="card${n.id === S.active ? " on" : ""}${S.picked.has(n.id) ? " picked" : ""}" data-note="${n.id}" draggable="true" style="--i:${Math.min(i, 14)}"><span class="pick" data-pick="${n.id}" aria-hidden="true">${ic("check")}</span>
       <div class="card-main"><span class="t">${n.fav ? `<svg class="i fav"><use href="#i-star"/></svg>` : ""}<span>${hl(titleOf(n))}</span></span>
       <span class="s">${hl(snippet(n)) || '<i style="opacity:.6">Nota vazia</i>'}</span><span class="m">${meta}</span></div>
-      ${img ? `<img class="thumb" src="${esc(img)}" alt="" loading="lazy">` : ""}</button>`;
+      ${img ? (WEB && anexoName(img) ? `<img class="thumb img-wait" src="${IMG_BLANK}" data-anexo="${esc(anexoName(img))}" alt="">` : `<img class="thumb" src="${esc(img)}" alt="" loading="lazy">`) : ""}</button>`;
   }).join("");
   box.innerHTML = h;
+  if (WEB) hydrateImgs(box);
   $("#list").classList.toggle("picking", S.pickMode || S.picked.size > 0);
   renderBulk();
   box.classList.remove("enter");
@@ -1217,7 +1225,7 @@ function toolbarHTML() {
     ${g(1, b("bold", "bold", "Negrito", "Ctrl+B") + b("italic", "italic", "Itálico", "Ctrl+I") + b("underline", "underline", "Sublinhado", "Ctrl+U") + b("strikeThrough", "strike", "Tachado"))}
     ${g(3, b("insertUnorderedList", "ul", "Lista com marcadores") + b("insertOrderedList", "ol", "Lista numerada") + b("checklist", "check-list", "Lista de tarefas", "Ctrl+Shift+L"))}
     ${g(1, `<button class="tb proof" data-cmd="proof" title="Corrigir texto (F7) · selecione um trecho ou corrija a nota inteira" aria-label="Corrigir texto">${ic("proof")}</button>`)}
-    ${g(1, b("link", "link", "Inserir link", "Ctrl+Shift+K") + b("image", "image", "Inserir imagem") + b("mic", "mic", "Gravar áudio"))}
+    ${g(1, b("link", "link", "Inserir link", "Ctrl+Shift+K") + b("image", "image", "Inserir imagem") + b("board", "board", "Inserir moodboard") + b("mic", "mic", "Gravar áudio"))}
     ${g(4, `<button class="tb" data-pop="align" title="Alinhamento" aria-label="Alinhamento"><span id="tbAlign">${ic("al")}</span>${ic("chev-d", "caret")}</button>` + b("outdent", "outdent", "Diminuir recuo") + b("indent", "indent", "Aumentar recuo"))}
     ${g(5, b("hr", "hr", "Linha divisória") + b("datetime", "clock", "Inserir data e hora", "F5") + b("clear", "eraser", "Limpar formatação"))}
     <span class="spacer"></span>
@@ -1266,7 +1274,8 @@ function renderPane(opts = {}) {
   const title = $("#title"), doc = $("#doc");
   title.value = n.title || "";
   stopAudio(); closeReview(true);
-  doc.innerHTML = n.html || "";
+  if (n.boards) { const used = new Set([...(n.html || "").matchAll(/data-board="([^"]+)"/g)].map((m) => m[1])); Object.keys(n.boards).forEach((k) => { if (!used.has(k)) delete n.boards[k]; }); if (!Object.keys(n.boards).length) delete n.boards; }
+  doc.innerHTML = webImgHTML(n.html || "");
   doc.querySelectorAll("[data-state]").forEach((x) => x.removeAttribute("data-state"));
   doc.querySelectorAll(".audio-block").forEach((x) => { x.contentEditable = "false"; });
   refreshNoteLinks(doc);
@@ -1275,13 +1284,15 @@ function renderPane(opts = {}) {
   if (S.prefs.font) doc.style.fontFamily = S.prefs.font;
   doc.style.fontSize = `calc(${S.prefs.size || 16}px * var(--zoom))`;
   ED = { id: n.id, title, doc };
+  hydrateEmbeds(doc); hydrateImgs(doc); ensureTrail(doc);
   updateStamp(false);
   doc.addEventListener("focus", () => {
     if (doc.contentEditable === "true" && !doc.firstElementChild && !doc.textContent.trim()) {
       doc.innerHTML = "<p><br></p>"; const r = document.createRange(); r.setStart(doc.firstChild, 0); r.collapse(true); const sl = getSelection(); sl.removeAllRanges(); sl.addRange(r);
     }
   });
-  doc.addEventListener("blur", () => { if (!doc.textContent.trim() && !doc.querySelector("img,hr,li")) doc.innerHTML = ""; });
+  doc.addEventListener("blur", () => { if (!doc.textContent.trim() && !doc.querySelector("img,hr,li,.mb-embed")) doc.innerHTML = ""; });
+  sc0BelowClick();
   autoGrow();
   renderFoot();
   layoutToolbar();
@@ -1320,7 +1331,7 @@ function onDocChange() {
   const n = S.notes.get(ED.id); if (!n || n.trashed) return;
   normalizeSizes();
   cleanPlaceholders(ED.doc);
-  n.html = ED.doc.innerHTML;
+  n.html = docHTML();
   n.text = docText().replace(/\u00a0/g, " ");
   n.updated = Date.now();
   markNote(n.id);
@@ -1340,9 +1351,17 @@ function onTitleChange() {
   const tb = $(`.tab[data-tab="${n.id}"] .tl`); if (tb) tb.textContent = t;
   renderListSoon();
 }
+function docHTML(doc = ED && ED.doc) {
+  if (!doc) return "";
+  if (!doc.querySelector(".mb-embed,img[data-anexo]")) return doc.innerHTML;
+  const c = inertDiv(doc.innerHTML);
+  c.querySelectorAll(".mb-embed").forEach((e) => { const sh = document.createElement("div"); sh.className = "mb-embed"; sh.setAttribute("contenteditable", "false"); sh.setAttribute("data-board", e.getAttribute("data-board") || ""); e.replaceWith(sh); });
+  c.querySelectorAll("img[data-anexo]").forEach((i) => { i.setAttribute("src", "anexo://img/" + i.getAttribute("data-anexo")); i.removeAttribute("data-anexo"); i.classList.remove("img-wait", "img-miss"); if (!i.className) i.removeAttribute("class"); });
+  return c.innerHTML;
+}
 function docText() {
   if (!ED) return "";
-  const ab = ED.doc.querySelectorAll(".audio-block"); ab.forEach((b) => (b.hidden = true));
+  const ab = ED.doc.querySelectorAll(".audio-block,.mb-embed"); ab.forEach((b) => (b.hidden = true));
   const t = ED.doc.innerText || ""; ab.forEach((b) => (b.hidden = false)); return t;
 }
 
@@ -1445,6 +1464,7 @@ function runCmd(cmd) {
     case "insertOrderedList": listToggle("ol"); break;
     case "link": openLinkEditor(); break;
     case "image": saveSel(); $("#imgInput").click(); break;
+    case "board": saveSel(); boardPickerForNote(); break;
     case "hr": exec("insertHorizontalRule"); break;
     case "datetime": insertDateTime(); break;
     case "mic": startRecording(); break;
@@ -1562,13 +1582,30 @@ async function insertImages(files) {
       const data = await fileToDataUrl(f);
       const name = await api.saveImage(data);
       restoreSel();
+      const sl0 = getSelection();
+      if (!sl0.rangeCount || !ED.doc.contains(sl0.anchorNode)) { ED.doc.focus({ preventScroll: true }); const r = document.createRange(); r.selectNodeContents(ED.doc); r.collapse(false); sl0.removeAllRanges(); sl0.addRange(r); }
       const inBlock = selEl()?.closest("li,h1,h2,h3,blockquote,pre");
       if (inBlock) { let top = inBlock; while (top.parentNode !== ED.doc) top = top.parentNode; const r = document.createRange(); r.setStartAfter(top); r.collapse(true); const sl = getSelection(); sl.removeAllRanges(); sl.addRange(r); }
-      document.execCommand("insertHTML", false, `<img src="${esc(imgSrc(name))}" alt=""><p><br></p>`);
+      const wurl = WEB && IMGS.url.get(name);
+      document.execCommand("insertHTML", false, wurl ? `<img src="${esc(wurl)}" data-anexo="${esc(name)}" alt="" data-fnnew="1">` : `<img src="${esc(imgSrc(name))}" alt="" data-fnnew="1">`);
+      const img = ED.doc.querySelector("img[data-fnnew]");
+      if (img) {
+        img.removeAttribute("data-fnnew");
+        hydrateImgs(img.parentNode || ED.doc);
+        let top = img; while (top.parentNode && top.parentNode !== ED.doc) top = top.parentNode;
+        if (top !== img && top.textContent.trim()) { const r = document.createRange(); r.setStartAfter(img); r.collapse(true); const sl = getSelection(); sl.removeAllRanges(); sl.addRange(r); }
+        else {
+          let pn = top.nextElementSibling;
+          if (!(pn && pn.tagName === "P" && !pn.textContent.trim() && !pn.querySelector("img,.mb-embed"))) { pn = document.createElement("p"); pn.innerHTML = "<br>"; top.parentNode.insertBefore(pn, top.nextSibling); }
+          caretAt(pn);
+        }
+      }
       saveSel();
     } catch (e) { console.error(e); toast("Não foi possível adicionar essa imagem."); }
   }
+  ensureTrail(ED.doc);
   onDocChange();
+  imgSyncSoon(2500);
 }
 
 /* ---------- colar com segurança ---------- */
@@ -1582,6 +1619,8 @@ function sanitize(html) {
       if (c.nodeType !== 1) return;
       let tag = c.tagName;
       if (DROP.has(tag)) { c.remove(); return; }
+      if (tag === "DIV" && c.classList.contains("mb-embed")) { const bid = c.getAttribute("data-board") || ""; if (/^bd_[\w]+$/.test(bid)) { const sh = doc.createElement("div"); sh.className = "mb-embed"; sh.setAttribute("contenteditable", "false"); sh.setAttribute("data-board", bid); c.replaceWith(sh); } else c.remove(); return; }
+      if (tag === "IMG" && /^[\w.-]+$/.test(c.getAttribute("data-anexo") || "")) c.setAttribute("src", "anexo://img/" + c.getAttribute("data-anexo"));
       if (tag === "H4" || tag === "H5" || tag === "H6") { const h = doc.createElement("h3"); h.innerHTML = c.innerHTML; c.replaceWith(h); walk(h); return; }
       if (!KEEP.has(tag)) { walk(c); c.replaceWith(...c.childNodes); return; }
       const keep = {};
@@ -1921,7 +1960,7 @@ function insertTranscript(noteId, file, text) {
     return;
   }
   const n = S.notes.get(noteId); if (!n) return;
-  const tmp = document.createElement("div"); tmp.innerHTML = n.html || "";
+  const tmp = inertDiv(n.html || "");
   const b2 = tmp.querySelector(sel); const p = document.createElement("p"); p.textContent = text;
   if (b2) b2.after(p); else tmp.appendChild(p);
   n.html = tmp.innerHTML; n.text = tmp.innerText; n.updated = Date.now(); markNote(n.id); renderList();
@@ -2170,7 +2209,7 @@ if (api.onQuick) {
     const now = Date.now(), nbId = S.nbs.has(nb) ? nb : defaultNb();
     let html = textToHTML(rest.replace(/^\s*\n/, ""));
     (audios || []).forEach((a) => { html += audioBlockHTML(a.file, a.dur || 0, a.peaks || Array(48).fill(.2)) + "<p><br></p>"; });
-    const tmp = document.createElement("div"); tmp.innerHTML = html;
+    const tmp = inertDiv(html);
     const n = { id: uid("nt_"), nb: nbId, title, html, text: tmp.innerText, tags: [], prio: 0, reminder: null, reminderDone: false, fav: false, trashed: false, created: now, updated: now };
     S.notes.set(n.id, n); markNote(n.id); flushSave();
     renderSidebar(); renderList(); $(`.card[data-note="${n.id}"]`)?.classList.add("fresh");
@@ -2364,7 +2403,12 @@ function mobShowList() { $("#app")?.classList.remove("note-open"); }
 function mobShowNote() { if (mqMobile.matches) { $("#app")?.classList.add("note-open"); try { history.pushState({ fn: "note" }, ""); } catch (e) {} } }
 function applyMobile() { document.documentElement.classList.toggle("mobile", mqMobile.matches); if (!mqMobile.matches) mobShowList(); }
 mqMobile.addEventListener("change", applyMobile);
-addEventListener("popstate", () => { if ($("#app")?.classList.contains("note-open")) mobShowList(); });
+let SHEET_POP_SKIP = false;
+addEventListener("popstate", () => {
+  if (SHEET_POP_SKIP) { SHEET_POP_SKIP = false; return; }
+  if ($("#mbSheet") && BRD && BRD.bid) { closeBoardSheet(true); return; }
+  if ($("#app")?.classList.contains("note-open")) mobShowList();
+});
 function openNote(id, o = {}) {
   if (!S.notes.has(id)) return;
   if (TPLED && id !== TPLED.id) endTplEdit(true);
@@ -2456,6 +2500,7 @@ function duplicateNote(id) {
   const c = { ...n, id: uid("nt_"), title: (n.title || "Sem título") + " (cópia)", tags: [...(n.tags || [])], created: now, updated: now, reminder: null, reminderDone: false };
   delete c.share;
   if (n.kind === "moodboard" && n.board) c.board = cloneBoardFresh(n.board);
+  if (n.boards) c.boards = JSON.parse(JSON.stringify(n.boards));
   S.notes.set(c.id, c); markNote(c.id); renderList(); renderSidebar(); openNote(c.id); toast("Nota duplicada");
 }
 function moveNote(id, nbId) {
@@ -2897,6 +2942,7 @@ const SLASH = [
   { id: "newlinked", icon: "note-add", label: "Nova nota vinculada", desc: "Cria uma nota e coloca o link aqui", kw: "nova nota vinculada criar" },
   { id: "link", icon: "link", label: "Link", desc: "Endereço de site", k: "Ctrl+Shift+K", kw: "link url site" },
   { id: "image", icon: "image", label: "Imagem", kw: "imagem foto figura" },
+  { id: "board", icon: "board", label: "Moodboard", desc: "Painel de fotos, cores e textos dentro da nota", kw: "moodboard painel referencias paleta colagem fotos" },
   { id: "mic", icon: "mic", label: "Gravar áudio", desc: "Grave e transforme em texto", kw: "audio gravar voz microfone transcrever" },
   { id: "date", icon: "clock", label: "Data e hora", k: "F5", kw: "data hora hoje" },
   { id: "proof", icon: "proof", label: "Corrigir texto", desc: "Gramática, pontuação e ortografia", k: "F7", kw: "corrigir revisar gramatica ortografia pontuacao" },
@@ -2973,7 +3019,7 @@ function insertNoteLink(n) {
   restoreSel();
   const sel = getSelection(); if (!sel.rangeCount) return;
   const r = sel.getRangeAt(0); r.deleteContents();
-  const tmp = document.createElement("div"); tmp.innerHTML = noteLinkHTML(n);
+  const tmp = inertDiv(noteLinkHTML(n));
   const a = tmp.firstChild, sp = document.createTextNode("\u00a0");
   r.insertNode(sp); r.insertNode(a);
   const r2 = document.createRange(); r2.setStartAfter(sp); r2.collapse(true); sel.removeAllRanges(); sel.addRange(r2);
@@ -3023,6 +3069,7 @@ function chooseTrig(i) {
     case "newlinked": { const n = createLinkedNote("Nova nota"); insertNoteLink(n); toast("Nota criada e vinculada", { label: "Abrir", run: () => openNote(n.id, { newTab: true }) }); break; }
     case "link": openLinkEditor(); break;
     case "image": $("#imgInput").click(); break;
+    case "board": saveSel(); boardPickerForNote(); break;
     case "mic": startRecording(); break;
     case "date": insertDateTime(); break;
     case "proof": proofText("all"); break;
@@ -3221,7 +3268,7 @@ async function importEvernote() {
         if (known.has(src)) { sk++; skipped++; continue; }
         let html = ""; try { html = enmlToHtml(en.enml, en.resources || {}, en.tasks || [], tasksAs); } catch (e) { html = `<p>${esc(en.enml.replace(/<[^>]+>/g, " "))}</p>`; }
         if (en.sourceUrl && /^https?:/i.test(en.sourceUrl)) html += `<p>Fonte: <a href="${esc(en.sourceUrl)}">${esc(en.sourceUrl)}</a></p>`;
-        const tmp = document.createElement("div"); tmp.innerHTML = html.replace(/<\/(p|div|li|h1|h2|h3|pre|tr|blockquote)>|<br\s*\/?>/gi, "$&\n");
+        const tmp = inertDiv(html.replace(/<\/(p|div|li|h1|h2|h3|pre|tr|blockquote)>|<br\s*\/?>/gi, "$&\n"));
         tmp.querySelectorAll(".audio-block").forEach((x) => x.remove());
         const created = en.created || Date.now(), updated = en.updated || created;
         const n = { id: uid("nt_"), nb: nb.id, title: en.title || "Sem título", html, text: (tmp.textContent || "").replace(/\n{3,}/g, "\n\n").trim(), tags: en.tags || [], prio: 0, reminder: null, reminderDone: false, fav: false, trashed: false, created, updated, src };
@@ -3338,6 +3385,8 @@ document.addEventListener("click", async (e) => {
   }
   /* dentro do texto da nota */
   if (ED && ED.doc.contains(t)) {
+    const emb = t.closest(".mb-embed");
+    if (emb) { e.preventDefault(); embedClick(emb, t); return; }
     $$("img.selected", ED.doc).forEach((i) => i !== t && i.classList.remove("selected"));
     const li = t.closest("ul.check > li");
     if (li && ED.doc.contentEditable === "true" && e.clientX - li.getBoundingClientRect().left < 26) { li.toggleAttribute("data-done"); onDocChange(); return; }
@@ -3425,6 +3474,34 @@ function imageMenu(img) {
   ], { below: true });
 }
 function finishImg(img) { img.classList.remove("selected"); onDocChange(); }
+/* com uma imagem selecionada: Enter/↓ cria linha embaixo, ↑ cria em cima, Delete apaga */
+document.addEventListener("keydown", (e) => {
+  if (!ED || ED.doc.contentEditable !== "true" || e.ctrlKey || e.metaKey || e.altKey) return;
+  const img = ED.doc.querySelector("img.selected"); if (!img) return;
+  const k = e.key;
+  if (k === "Delete" || k === "Backspace") { e.preventDefault(); e.stopImmediatePropagation(); closePop(); img.remove(); ensureTrail(ED.doc); onDocChange(); return; }
+  if (k !== "Enter" && k !== "ArrowDown" && k !== "ArrowUp") return;
+  e.preventDefault(); e.stopImmediatePropagation(); closePop();
+  img.classList.remove("selected");
+  let top = img; while (top.parentNode && top.parentNode !== ED.doc) top = top.parentNode;
+  const up = k === "ArrowUp";
+  let p = up ? top.previousElementSibling : top.nextElementSibling;
+  if (!(p && p.tagName === "P" && !p.textContent.trim() && !p.querySelector("img,.mb-embed"))) { p = document.createElement("p"); p.innerHTML = "<br>"; top.parentNode.insertBefore(p, up ? top : top.nextSibling); }
+  ED.doc.focus({ preventScroll: true }); caretAt(p); p.scrollIntoView({ block: "nearest" }); onDocChange();
+}, true);
+function sc0BelowClick() {
+  const sc = $("#edScroll"); if (!sc) return;
+  sc.addEventListener("mousedown", (e) => {
+    if (!ED || ED.doc.contentEditable !== "true" || e.button !== 0) return;
+    if (e.target !== sc && !(e.target.classList && e.target.classList.contains("page"))) return;
+    const r = ED.doc.getBoundingClientRect(); if (e.clientY < r.bottom - 2) return;
+    e.preventDefault();
+    if (!ED.doc.firstElementChild) { ED.doc.focus(); return; }
+    ensureTrail(ED.doc);
+    const last = ED.doc.lastElementChild; ED.doc.focus({ preventScroll: true });
+    if (last) caretAt(last, true);
+  });
+}
 
 document.addEventListener("input", (e) => {
   const t = e.target;
@@ -3462,11 +3539,12 @@ document.addEventListener("paste", async (e) => {
   if (html && !e.shiftKey) {
     e.preventDefault();
     if (selEl()?.closest("pre")) document.execCommand("insertText", false, cd.getData("text/plain"));
-    else document.execCommand("insertHTML", false, sanitize(html));
+    else { document.execCommand("insertHTML", false, webImgHTML(sanitize(html))); hydrateEmbeds(ED.doc); hydrateImgs(ED.doc); ensureTrail(ED.doc); }
     onDocChange();
     return;
   }
   const text = cd.getData("text/plain");
+  if (!text && !WEB && api.clipboardImages) { e.preventDefault(); saveSel(); clipboardFiles().then((fs) => { if (fs.length) insertImages(fs); }); return; }
   if (/^(https?:\/\/|www\.)\S+$/.test(text.trim()) && S.prefs.autolink && !selEl()?.closest("a,pre")) {
     e.preventDefault();
     const url = normUrl(text.trim()); const s = getSelection();
@@ -3713,7 +3791,7 @@ function welcomeNote(nbId) {
 <ul class="check"><li data-done="">Crie cadernos no + ao lado de “Cadernos”</li><li>Junte cadernos numa pilha pelo menu ⋯ do caderno</li><li>Adicione etiquetas, prioridade e lembretes no rodapé da nota</li><li>Filtre e classifique pelos botões acima da lista de notas</li></ul>
 <blockquote>Tudo é salvo sozinho enquanto você digita. Ao fechar e abrir o app, ele volta exatamente onde você parou.</blockquote>
 <p>Atalhos úteis: <b>Ctrl+N</b> nova nota · <b>Ctrl+K</b> pesquisar · <b>Ctrl+F</b> localizar · <b>Ctrl+Shift+E</b> expandir · <b>F11</b> tela cheia (Esc sai).</p>`;
-  const tmp = document.createElement("div"); tmp.innerHTML = html;
+  const tmp = inertDiv(html);
   return { id: uid("nt_"), nb: nbId, title: "Bem-vindo ao ForeverNote", html, text: tmp.innerText, tags: ["começo"], prio: 0, reminder: null, reminderDone: false, fav: true, trashed: false, created: now, updated: now };
 }
 
@@ -3873,18 +3951,28 @@ function newMoodboard(tplId) {
   const t = BOARD_TEMPLATES.find((x) => x.id === tplId) || BOARD_TEMPLATES[0];
   newNote({ kind: "moodboard", title: t.id === "blank" ? "" : "Moodboard", board: t.make(), text: "Moodboard" });
 }
-function moodboardPicker() {
+function moodboardPicker(o = {}) {
   const mine = S.prefs.boardTpls || [];
+  const existing = o.onPick ? [...S.notes.values()].filter((x) => x.kind === "moodboard" && !x.trashed && x.board && (x.board.items || []).length).sort((a, c) => (c.updated || 0) - (a.updated || 0)).slice(0, 30) : [];
   const card = (id, name, desc, board, i, del) => `<div class="tpl mb-tpl" role="button" tabindex="0" data-mbt="${esc(id)}" style="--i:${i}">
       <div class="tpl-prev mb-prev">${boardPreviewHTML(board)}</div>
       <div class="tpl-meta"><span class="tpl-ic">${ic(del ? "template" : "board")}</span><div><b>${esc(name)}</b><span>${esc(desc)}</span></div></div>
       ${del ? `<button class="mb-tdel" data-mbdel="${esc(id)}" title="Apagar modelo" aria-label="Apagar modelo">${ic("x")}</button>` : ""}</div>`;
-  const m = modal(`<div class="m-head"><div class="m-ic">${ic("board")}</div><h2>Novo moodboard</h2><button class="ib" id="mbX" aria-label="Fechar">${ic("x")}</button></div>
+  const m = modal(`<div class="m-head"><div class="m-ic">${ic("board")}</div><h2>${o.onPick ? "Inserir moodboard na nota" : "Novo moodboard"}</h2><button class="ib" id="mbX" aria-label="Fechar">${ic("x")}</button></div>
     <div class="m-body tpl-body">
+      ${existing.length ? `<div class="mb-tsec">Seus moodboards <span class="mb-tsub">entram como cópia — o original não muda</span></div><div class="tpl-grid mb-grid">${existing.map((x, i) => card("note:" + x.id, titleOf(x), "Atualizado " + fmtDate(x.updated), x.board, i, false)).join("")}</div><div class="mb-tsec">Começar do zero</div>` : ""}
       ${mine.length ? `<div class="mb-tsec">Meus modelos</div><div class="tpl-grid mb-grid">${mine.map((t, i) => card(t.id, t.name, "Seu modelo salvo", t.board, i, true)).join("")}</div><div class="mb-tsec">Prontos</div>` : ""}
       <div class="tpl-grid mb-grid">${BOARD_TEMPLATES.map((t, i) => card(t.id, t.name, t.desc, t.make(), i + mine.length, false)).join("")}</div></div>`, { wide: true });
   m.querySelector(".modal").classList.add("tpl-modal");
-  const pick = (id) => { m.close(); newMoodboard(id); };
+  const pick = (id) => {
+    m.close();
+    if (!o.onPick) { newMoodboard(id); return; }
+    if (id.startsWith("note:")) { const src = S.notes.get(id.slice(5)); if (src && src.board) { const b = cloneBoardFresh(src.board); b.title = (src.title || "").trim() || undefined; o.onPick(b, { copy: true }); } return; }
+    const custom = mine.find((t) => t.id === id);
+    if (custom) { const b = cloneBoardFresh(custom.board); b.title = custom.name; o.onPick(b, {}); return; }
+    const t = BOARD_TEMPLATES.find((x) => x.id === id) || BOARD_TEMPLATES[0];
+    o.onPick(mbMigrate(t.make()), {});
+  };
   m.addEventListener("click", async (e) => {
     if (e.target.closest("#mbX")) return m.close();
     const d = e.target.closest("[data-mbdel]");
@@ -3895,7 +3983,7 @@ function moodboardPicker() {
       if (await ask({ title: "Apagar modelo?", text: `O modelo “${esc(t.name)}” sai da lista. Os moodboards já criados com ele não mudam.`, ok: "Apagar", danger: true, icon: "trash" })) {
         S.prefs.boardTpls = (S.prefs.boardTpls || []).filter((x) => x.id !== t.id); savePrefs(); sysPush(); toast("Modelo apagado");
       }
-      return moodboardPicker();
+      return moodboardPicker(o);
     }
     const c = e.target.closest("[data-mbt]"); if (c) pick(c.dataset.mbt);
   });
@@ -3915,20 +4003,37 @@ function boardPreviewHTML(board) {
 
 /* ---------- acesso ao estado ---------- */
 const mbNote = () => (BRD ? S.notes.get(BRD.id) : null);
-const mbBoard = () => { const n = mbNote(); return n ? n.board : null; };
+const getBoard = (n, bid) => (n ? (bid ? (n.boards && n.boards[bid]) || null : n.board) : null);
+function setBoard(n, bid, b) { if (bid) { n.boards = n.boards || {}; n.boards[bid] = b; } else n.board = b; }
+const mbBoard = () => getBoard(mbNote(), BRD && BRD.bid);
+const histKey = () => BRD.id + (BRD.bid ? "#" + BRD.bid : "");
 const mbItem = (id) => { const b = mbBoard(); return b && id ? b.items.find((x) => x.id === id) || null : null; };
 const mbActive = () => !!(BRD && S.active === BRD.id && $("#mbCanvas"));
 const mbEl = (id) => (id ? $(`#mbCanvas > [data-it="${id}"]`) : null);
 function boardBusy(id) { return !!(BRD && BRD.id === id && mbActive() && (BRD.drag || BRD.editing || BRD.crop || BRD.pinch || dirty.has(id))); }
-function hist() { let h = HIST.get(BRD.id); if (!h) { h = { s: [snap(mbBoard())], i: 0 }; HIST.set(BRD.id, h); } return h; }
+function hist() { let h = HIST.get(histKey()); if (!h) { h = { s: [snap(mbBoard())], i: 0 }; HIST.set(histKey(), h); } return h; }
+/* mudança real vinda do outro aparelho: vira mais um passo (dá para desfazer), sem apagar o que já havia */
+function mbRemoteStep() {
+  if (!BRD || !mbBoard()) return;
+  const h = HIST.get(histKey()); if (!h) return;
+  h.s = h.s.slice(0, h.i + 1); h.s.push(snap(mbBoard())); if (h.s.length > 150) h.s.shift(); h.i = h.s.length - 1;
+}
 
 /* ---------- render do editor ---------- */
 function renderBoard(n, opts = {}) {
-  if (!BRD || BRD.id !== n.id) { if (BRD && BRD.ro) BRD.ro.disconnect(); BRD = { id: n.id, sel: null, view: 1, base: 0, ptrs: new Map() }; }
+  const bid = opts.bid || null, host = opts.host || $("#pane");
+  if (!BRD || BRD.id !== n.id || (BRD.bid || null) !== bid) { if (BRD && BRD.ro) BRD.ro.disconnect(); BRD = { id: n.id, bid, sel: null, view: 1, base: 0, ptrs: new Map() }; }
   else { if (BRD.ro) BRD.ro.disconnect(); Object.assign(BRD, { editing: null, crop: null, pick: null, drag: null, pinch: null, swap: null, ptrs: new Map() }); }
-  n.board = mbMigrate(n.board);
-  const b = n.board, ro = n.trashed;
-  $("#pane").innerHTML = `
+  setBoard(n, bid, mbMigrate(getBoard(n, bid)));
+  const b = getBoard(n, bid), ro = n.trashed;
+  const top = bid ? `
+    <div class="ed-top mb-top mbs-top">
+      <button class="btn mbs-back" data-mbs="close" title="Voltar para a nota (Esc)">${ic("left")}<span>Voltar para a nota</span></button>
+      <div class="crumb mbs-crumb"><span>${ic("notes")}<span>${esc(titleOf(n))}</span></span>${ic("chev-r", "sep")}<span class="cur">${ic("board")}Moodboard</span></div>
+      <button class="ib" data-mbs="export" title="Baixar como imagem" aria-label="Baixar como imagem">${ic("download")}</button>
+      <button class="btn primary sm mbs-done" data-mbs="close">${ic("check")}<span>Concluir</span></button>
+    </div>` : "";
+  host.innerHTML = (top || `
     <div class="ed-top mb-top">
       <button class="ib mob-back" data-act="mobback" aria-label="Voltar">${ic("left")}</button>
       <button class="ib" data-act="expand" id="btnExpand" title="${S.expanded ? "Mostrar cadernos e lista" : "Expandir"} (Ctrl+Shift+E)" aria-label="Expandir">${ic(S.expanded ? "uncollapse" : "collapse")}</button>
@@ -3938,10 +4043,10 @@ function renderBoard(n, opts = {}) {
       <button class="ib" data-act="mbexport" title="Baixar como imagem" aria-label="Baixar como imagem">${ic("download")}</button>
       ${shareBtnsHTML(n)}`}
       <button class="ib" data-act="notemenu" title="Mais opções" aria-label="Mais opções">${ic("more")}</button>
-    </div>
-    ${ro ? `<div class="trash-banner">${ic("trash")}<span>Este moodboard está na lixeira.</span><button class="btn" data-act="restore">${ic("restore")}Restaurar</button><button class="btn danger" data-act="purge">Excluir para sempre</button></div>` : `
+    </div>`) + `
+    ${ro ? `<div class="trash-banner">${ic("trash")}<span>${bid ? "Esta nota está na lixeira." : "Este moodboard está na lixeira."}</span><button class="btn" data-act="restore">${ic("restore")}Restaurar</button><button class="btn danger" data-act="purge">Excluir para sempre</button></div>` : `
     <div class="mb-tools" id="mbTools">
-      <input class="mb-title" id="mbTitle" placeholder="Título do moodboard" value="${esc(n.title || "")}" spellcheck="false" autocomplete="off">
+      <input class="mb-title" id="mbTitle" placeholder="${bid ? "Nome do moodboard (opcional)" : "Título do moodboard"}" value="${esc((bid ? b.title : n.title) || "")}" spellcheck="false" autocomplete="off">
       <div class="mb-tbar">
         <button class="mb-tb" data-mb="addimg" title="Adicionar fotos (ou arraste para a folha)">${ic("image")}<span>Foto</span></button>
         <button class="mb-tb" data-mb="addtext" title="Adicionar texto">${ic("type")}<span>Texto</span></button>
@@ -3973,7 +4078,7 @@ function renderBoard(n, opts = {}) {
   updUndoBtns(); showCtx();
   const t = $("#mbTitle");
   if (t) {
-    t.addEventListener("input", () => { const nn = mbNote(); if (!nn) return; nn.title = t.value; nn.updated = Date.now(); markNote(nn.id); const c = $("#crumbTitle"); if (c) c.textContent = titleOf(nn); renderTabs(); renderListSoon(); });
+    t.addEventListener("input", () => { const nn = mbNote(); if (!nn) return; if (BRD.bid) { const bb = mbBoard(); if (bb) { bb.title = t.value; if (!bb.title) delete bb.title; mbSaveSoft(); } return; } nn.title = t.value; nn.updated = Date.now(); markNote(nn.id); const c = $("#crumbTitle"); if (c) c.textContent = titleOf(nn); renderTabs(); renderListSoon(); });
     t.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); t.blur(); } });
     if (opts.focusTitle) setTimeout(() => t.focus(), 80);
   }
@@ -4061,24 +4166,24 @@ function placeGhost() {
   const b = mbBoard(), r = itemBox(b, it), c = cropBox(it, b);
   gh.style.left = r.x + (c.l / 100) * r.w + "%"; gh.style.top = r.y + (c.t / 100) * r.h + "%"; gh.style.width = (c.w / 100) * r.w + "%"; gh.style.height = (c.h / 100) * r.h + "%";
 }
-function updUndoBtns() { if (!BRD) return; const h = HIST.get(BRD.id); const u = $("#mbUndo"), r = $("#mbRedo"); if (u) u.disabled = !h || h.i <= 0; if (r) r.disabled = !h || h.i >= h.s.length - 1; }
+function updUndoBtns() { if (!BRD) return; const h = HIST.get(histKey()); const u = $("#mbUndo"), r = $("#mbRedo"); if (u) u.disabled = !h || h.i <= 0; if (r) r.disabled = !h || h.i >= h.s.length - 1; }
 
 /* ---------- gravar e desfazer ---------- */
-function mbSave(n) { n.updated = Date.now(); n.text = boardText(n); markNote(n.id); renderListSoon(); }
+function mbSave(n) { n.updated = Date.now(); if (n.kind === "moodboard") n.text = boardText(n); if (BRD) BRD.soft = false; markNote(n.id); renderListSoon(); }
 let mbSoftT = 0;
-function mbSaveSoft() { const id = BRD && BRD.id; clearTimeout(mbSoftT); mbSoftT = setTimeout(() => { const n = S.notes.get(id); if (n) mbSave(n); }, 400); }
+function mbSaveSoft() { const id = BRD && BRD.id; if (BRD) BRD.soft = true; clearTimeout(mbSoftT); mbSoftT = setTimeout(() => { const n = S.notes.get(id); if (n) mbSave(n); }, 400); }
 function mbCommit(o = {}) {
   const n = mbNote(); if (!n) return;
   clearTimeout(mbSoftT);
   syncBoard(o);
-  const h = hist(); h.s = h.s.slice(0, h.i + 1); h.s.push(snap(n.board)); if (h.s.length > 150) h.s.shift(); h.i = h.s.length - 1;
+  const h = hist(); h.s = h.s.slice(0, h.i + 1); h.s.push(snap(mbBoard())); if (h.s.length > 150) h.s.shift(); h.i = h.s.length - 1;
   mbSave(n); updUndoBtns();
   if (!BRD.drag) showCtx();
 }
 function mbRestore(sn) {
   const n = mbNote(); if (!n) return;
-  n.board = snap(sn);
-  if (!n.board.items.some((x) => x.id === BRD.sel)) BRD.sel = null;
+  setBoard(n, BRD.bid, snap(sn));
+  if (!mbBoard().items.some((x) => x.id === BRD.sel)) BRD.sel = null;
   mbFit(); syncBoard({ anim: true, quiet: true }); mbSave(n); updUndoBtns(); showCtx();
 }
 function mbUndo() { if (!mbActive()) return; if (BRD.editing) endTextEdit(); if (BRD.crop) endCrop(); const h = hist(); if (h.i <= 0) return; h.i--; mbRestore(h.s[h.i]); }
@@ -4199,7 +4304,8 @@ async function mbAddFiles(files, o = {}) {
   for (const f of files) { try { loaded.push(await boardImageFile(f)); } catch (e) {} }
   if (!BRD || BRD.id !== id0 || !mbActive()) return;
   if (!loaded.length) { toast("Não consegui abrir essas imagens."); return; }
-  const b = n.board, R = b.ratio || 1.25, q = [...loaded];
+  const b = mbBoard(); if (!b) return;
+  const R = b.ratio || 1.25, q = [...loaded];
   const put = (it, d) => { it.src = d.src; it.ia = r3(d.ratio); delete it.fx; delete it.fy; delete it.zoom; };
   let last = null;
   const tgt = o.target && mbItem(o.target);
@@ -4631,9 +4737,22 @@ document.addEventListener("paste", (e) => {
   if (BRD.editing || (t && (t.isContentEditable || /^(INPUT|TEXTAREA)$/.test(t.tagName || "")))) return;
   const files = [...((e.clipboardData && e.clipboardData.files) || [])].filter((f) => /^image\//.test(f.type));
   if (files.length) { e.preventDefault(); e.stopImmediatePropagation(); const s = mbItem(BRD.sel); mbAddFiles(files, { target: s && s.type === "image" ? s.id : null }); return; }
+  const cd = e.clipboardData, empty = !cd || (!cd.getData("text/plain") && !cd.getData("text/html"));
+  if (empty && !WEB && api.clipboardImages) {
+    e.preventDefault(); e.stopImmediatePropagation();
+    const id0 = BRD.id, s = mbItem(BRD.sel), tgt = s && s.type === "image" ? s.id : null;
+    clipboardFiles().then((fs) => { if (!mbActive() || BRD.id !== id0) return; if (fs.length) mbAddFiles(fs, { target: tgt }); else if (MBCLIP) mbPasteItem(); });
+    return;
+  }
   if (MBCLIP) { e.preventDefault(); e.stopImmediatePropagation(); mbPasteItem(); }
 }, true);
 
+async function clipboardFiles() {
+  try {
+    const list = (await api.clipboardImages()) || [];
+    return list.map((x) => { const b = dataUrlToBlob(x.data); return b ? new File([b], x.name || "imagem", { type: x.type || b.type }) : null; }).filter(Boolean);
+  } catch (e) { return []; }
+}
 /* ---------- teclado ---------- */
 function nudge(key, big) {
   const it = mbItem(BRD.sel); if (!it || it.locked) return;
@@ -4655,6 +4774,7 @@ document.addEventListener("keydown", (e) => {
   else if (BRD.crop && (e.key === "Escape" || e.key === "Enter")) endCrop();
   else if (mod && k === "z" && !e.shiftKey) mbUndo();
   else if (mod && (k === "y" || (k === "z" && e.shiftKey))) mbRedo();
+  else if (e.key === "Escape" && BRD.bid && !BRD.sel) closeBoardSheet();
   else if (!BRD.sel) done = false;
   else if (e.key === "Delete" || e.key === "Backspace") { if (!mbItem(BRD.sel)?.locked) mbDelete(); }
   else if (e.key === "Escape") mbSelect(null);
@@ -4767,10 +4887,10 @@ async function extractPalette(srcs, N) {
 }
 async function mbGeneratePalette(N) {
   const n = mbNote(); if (!n) return;
-  const b = n.board, srcs = [...new Set(b.items.filter((i) => i.type === "image" && i.src).map((i) => i.src))];
+  const b = mbBoard(), srcs = [...new Set(b.items.filter((i) => i.type === "image" && i.src).map((i) => i.src))];
   if (!srcs.length) { toast("Coloque algumas fotos primeiro — as cores saem delas."); return; }
   const colors = await extractPalette(srcs, N);
-  if (!mbActive() || mbNote() !== n) return;
+  if (!mbActive() || mbBoard() !== b) return;
   if (!colors.length) { toast("Não consegui tirar as cores dessas fotos."); return; }
   b.items = b.items.filter((i) => !(i.type === "color" && i.pal));
   const z = topZ(b);
@@ -4829,10 +4949,10 @@ function sheetPop(btn) {
 }
 async function mbSaveTemplate() {
   const n = mbNote(); if (!n) return;
-  const r = await ask({ title: "Salvar como modelo", icon: "template", text: "O layout vai para “Meus modelos” na hora de criar um moodboard — no PC e no celular.", input: "Nome do modelo", value: (n.title || "").trim() || "Meu modelo", ok: "Salvar",
+  const r = await ask({ title: "Salvar como modelo", icon: "template", text: "O layout vai para “Meus modelos” na hora de criar um moodboard — no PC e no celular.", input: "Nome do modelo", value: ((BRD.bid ? mbBoard().title : n.title) || "").trim() || "Meu modelo", ok: "Salvar",
     extra: `<label class="mb-askopt">O que salvar<select class="field" data-extra><option value="0">Só o layout (sem as fotos)</option><option value="1">O layout com as fotos</option></select></label>` });
   if (!r || !r.v) return;
-  const b = snap(n.board), keep = r.extra === "1";
+  const b = snap(mbBoard()), keep = r.extra === "1";
   b.items.forEach((it) => { delete it.locked; if (!keep && it.type === "image") { it.src = ""; delete it.ia; delete it.fx; delete it.fy; delete it.zoom; } });
   S.prefs.boardTpls = [{ id: uid("bt_"), name: r.v.slice(0, 60), board: b, created: Date.now() }, ...(S.prefs.boardTpls || [])].slice(0, 40);
   savePrefs(); sysPush();
@@ -4889,17 +5009,23 @@ async function mbRenderCanvas(board, W) {
   return c;
 }
 const boardFileName = (n) => (titleOf(n).replace(/[\\/:*?"<>|]+/g, "").trim() || "moodboard").slice(0, 80);
-async function boardBlob(n, type = "image/png", W = 1800) { const c = await mbRenderCanvas(n.board, W); return new Promise((res) => c.toBlob(res, type, 0.92)); }
-async function mbExport(id) {
-  const n = S.notes.get(id || S.active); if (!n || n.kind !== "moodboard") return;
-  if (mbActive() && BRD.editing) endTextEdit();
+async function boardBlob(n, type = "image/png", W = 1800, board) { const c = await mbRenderCanvas(board || n.board, W); return new Promise((res) => c.toBlob(res, type, 0.92)); }
+const embedFileName = (n, b) => ((b && b.title) || titleOf(n) + " - moodboard").replace(/[\\/:*?"<>|]+/g, "").trim().slice(0, 80) || "moodboard";
+async function exportBoardPNG(board, name) {
   toast("Gerando a imagem…");
-  const blob = await boardBlob(n);
+  const c = await mbRenderCanvas(board, 1800), blob = await new Promise((res) => c.toBlob(res, "image/png", 0.92));
   if (!blob) { toast("Não consegui gerar a imagem."); return; }
   const url = URL.createObjectURL(blob), a = document.createElement("a");
-  a.href = url; a.download = boardFileName(n) + ".png"; document.body.appendChild(a); a.click(); a.remove();
+  a.href = url; a.download = name + ".png"; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
   toast("Imagem salva ✨");
+}
+async function mbExport(id) {
+  const n = S.notes.get(id || S.active); if (!n) return;
+  if (mbActive() && BRD.editing) endTextEdit();
+  if (BRD && BRD.bid && BRD.id === n.id && mbBoard()) return exportBoardPNG(mbBoard(), embedFileName(n, mbBoard()));
+  if (n.kind !== "moodboard") return;
+  return exportBoardPNG(n.board, boardFileName(n));
 }
 async function mbCopyImage(n) {
   try { const blob = await boardBlob(n, "image/png", 1600); await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]); toast("Imagem copiada — é só colar no WhatsApp, e-mail…"); }
@@ -4950,7 +5076,7 @@ function shareErrMsg(e) {
 async function shareInlineImg(src) {
   try {
     let data = src;
-    if (/^anexo:/i.test(src)) { const name = decodeURIComponent(src.replace(/^anexo:\/\/img\//i, "")); data = api.imageData ? await api.imageData(name) : null; }
+    if (/^anexo:/i.test(src)) { const name = decodeURIComponent(src.replace(/^anexo:\/\/img\//i, "")); data = await imageDataFor(name); }
     else if (/^blob:/i.test(src)) { const bl = await (await fetch(src)).blob(); data = await new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.onerror = () => r(null); fr.readAsDataURL(bl); }); }
     if (/^https:/i.test(src) && data === src) return src;
     if (!/^data:image\//i.test(data || "")) return null;
@@ -4962,8 +5088,13 @@ async function shareInlineImg(src) {
     return c.toDataURL("image/jpeg", 0.84);
   } catch (e) { return null; }
 }
-async function shareHTML(html) {
-  const box = document.createElement("div"); box.innerHTML = html || "";
+async function shareHTML(html, n) {
+  const box = inertDiv(html || "");
+  for (const el of [...box.querySelectorAll(".mb-embed")]) {
+    const b = n && n.boards && n.boards[el.getAttribute("data-board")];
+    if (!b) { el.remove(); continue; }
+    try { const c = await mbRenderCanvas(mbMigrate(b), 1400); const p = document.createElement("p"); const im = document.createElement("img"); im.className = "sh-board"; im.alt = b.title || "Moodboard"; im.src = c.toDataURL("image/jpeg", 0.88); p.appendChild(im); el.replaceWith(p); } catch (e) { el.remove(); }
+  }
   box.querySelectorAll(".audio-block").forEach((a) => { const p = document.createElement("p"); p.className = "sh-audio"; p.textContent = "Gravação de áudio (só no app)"; a.replaceWith(p); });
   box.querySelectorAll("a.note-link").forEach((a) => a.replaceWith(document.createTextNode(a.textContent)));
   box.querySelectorAll("a.file-link").forEach((a) => { const s = document.createElement("span"); s.className = "sh-file"; s.textContent = a.textContent; a.replaceWith(s); });
@@ -4977,7 +5108,7 @@ async function shareSnapshot(n) {
     const cols = [...palItems(b).sort((a, d) => (a.pi || 0) - (d.pi || 0)), ...b.items.filter((i) => i.type === "color" && !i.pal)].map((i) => (i.color || "").toLowerCase());
     return { kind: "moodboard", title: (n.title || "").trim(), img: c.toDataURL("image/jpeg", 0.88), w: c.width, h: c.height, colors: [...new Set(cols)], updated: n.updated || Date.now() };
   }
-  return { kind: "note", title: (n.title || "").trim(), html: await shareHTML(n.html), updated: n.updated || Date.now() };
+  return { kind: "note", title: (n.title || "").trim(), html: await shareHTML(n.html, n), updated: n.updated || Date.now() };
 }
 async function sharePublish(n) {
   if (!SB || !CLOUD.user) throw Object.assign(new Error("login"), { code: "login" });
@@ -5092,6 +5223,331 @@ async function sysPush() {
   // deleted:true faz versões antigas do app ignorarem esta linha
   try { await SB.from("notes").upsert({ id: SYS_ID, user_id: CLOUD.user.id, data: { kind: "sys", boardTpls: S.prefs.boardTpls || [], webBase: S.prefs.webBase || "" }, updated: S.prefs.sysUpd, deleted: true }, { onConflict: "user_id,id" }); } catch (e) {}
 }
+
+/* =========================================================
+   Moodboard dentro da nota: bloco no texto + editor em tela cheia
+   ========================================================= */
+function boardStaticHTML(board) {
+  const b = mbMigrate(board), R = b.ratio || 1.25;
+  const its = [...b.items].sort((a, c) => (a.z || 0) - (c.z || 0));
+  return `<div class="mbe-canvas${b.hex ? " hexon" : ""}" style="aspect-ratio:${(1 / R).toFixed(4)};--R:${R};background:${esc(b.bg || "#faf6f4")};--hexc:${hexLabelColor(b.bg || "#fff")};--emptyc:${lum(b.bg || "#fff") > 0.55 ? "rgba(40,30,35,.4)" : "rgba(255,255,255,.55)"}">${its.map((it) => {
+    const pos = `left:${it.x}%;top:${it.y}%;width:${it.w}%;z-index:${it.z || 0};`;
+    if (it.type === "image") {
+      const box = `${pos}height:${it.h}%;border-radius:${it.rad || 0}cqw`;
+      if (!it.src) return `<div class="mbe-i e" style="${box}">${ic("image")}</div>`;
+      if (!it.ia) return `<div class="mbe-i" style="${box}"><img class="cover" src="${esc(it.src)}" alt="" loading="lazy" decoding="async"></div>`;
+      const c = cropBox(it, b);
+      return `<div class="mbe-i" style="${box}"><img src="${esc(it.src)}" alt="" loading="lazy" decoding="async" style="left:${c.l}%;top:${c.t}%;width:${c.w}%;height:${c.h}%"></div>`;
+    }
+    if (it.type === "color") return `<div class="mbe-c" style="${pos}background:${esc(it.color || "#ccc")}"><span>${esc((it.color || "").toUpperCase())}</span></div>`;
+    if (it.type === "text") return `<div class="mbe-t" style="${pos}color:${esc(it.color || "#20151a")};font-family:${boardFontCss(it.font).replace(/"/g, "'")};font-size:${it.size || 5}cqw;font-weight:${it.weight || 600};font-style:${it.italic ? "italic" : "normal"};text-transform:${it.caps ? "uppercase" : "none"};letter-spacing:${it.ls || 0}em;text-align:${it.align || "left"}">${esc(it.text || "")}</div>`;
+    return "";
+  }).join("")}</div>`;
+}
+/* desenha os blocos de moodboard da nota aberta (e cuida de colados/duplicados) */
+function hydrateEmbeds(root, only) {
+  const n = ED && S.notes.get(ED.id); if (!n || !root) return;
+  const seen = new Set(); let changed = false;
+  root.querySelectorAll(".mb-embed").forEach((el) => {
+    let bid = el.getAttribute("data-board") || "";
+    if (only && bid !== only) { seen.add(bid); return; }
+    el.setAttribute("contenteditable", "false");
+    let b = bid && n.boards && n.boards[bid];
+    if (!b && bid) {
+      // colado de outra nota (ou de um modelo): vira uma cópia desta nota
+      for (const o of S.notes.values()) if (o !== n && o.boards && o.boards[bid]) { b = snap(mbMigrate(o.boards[bid])); n.boards = n.boards || {}; n.boards[bid] = b; changed = true; break; }
+    }
+    if (b && seen.has(bid)) { const nb = uid("bd_"); n.boards[nb] = snap(mbMigrate(b)); b = n.boards[nb]; bid = nb; el.setAttribute("data-board", nb); changed = true; }
+    seen.add(bid);
+    if (!b) { el.innerHTML = `<div class="mbe-miss">${ic("board")}<span>Este moodboard não está mais disponível.</span><button class="mbe-btn" data-mbe="remove">${ic("trash")}Remover</button></div>`; return; }
+    const ro = ED.doc.contentEditable !== "true", cnt = b.items.filter((i) => i.type === "image" && i.src).length;
+    el.innerHTML = `<div class="mbe-view" title="${ro ? "" : "Clique para editar"}">${boardStaticHTML(b)}</div>
+      <div class="mbe-bar"><span class="mbe-tag">${ic("board")}<b>${esc((b.title || "").trim() || "Moodboard")}</b>${cnt ? `<i>${plural(cnt, "foto", "fotos")}</i>` : ""}</span><span class="grow"></span>
+        ${ro ? "" : `<button class="mbe-btn" data-mbe="edit">${ic("edit")}<span>Editar</span></button>`}<button class="mbe-btn ic" data-mbe="more" title="Mais opções" aria-label="Mais opções">${ic("more")}</button></div>`;
+  });
+  if (changed) { n.updated = Date.now(); markNote(n.id); }
+}
+function embedClick(el, t) {
+  const n = ED && S.notes.get(ED.id); if (!n) return;
+  const bid = el.getAttribute("data-board"), b = n.boards && n.boards[bid], ro = ED.doc.contentEditable !== "true";
+  const btn = t.closest("[data-mbe]"), k = btn && btn.dataset.mbe;
+  if (k === "remove") { removeEmbed(el); return; }
+  if (!b) return;
+  if (k === "more") {
+    menu(btn, [
+      ...(ro ? [] : [{ icon: "edit", label: "Editar moodboard", run: () => openBoardSheet(n.id, bid) }]),
+      { icon: "download", label: "Baixar como imagem", run: () => exportBoardPNG(b, embedFileName(n, b)) },
+      { icon: "board", label: "Copiar para a lista como moodboard", run: () => embedToList(n, b) },
+      ...(ro ? [] : ["-", { icon: "trash", label: "Remover da nota", danger: true, run: () => removeEmbed(el) }])
+    ], { right: true });
+    return;
+  }
+  if (ro) { exportBoardPNG(b, embedFileName(n, b)); return; }
+  openBoardSheet(n.id, bid);
+}
+function removeEmbed(el) {
+  if (!ED || ED.doc.contentEditable !== "true") return;
+  ED.doc.focus({ preventScroll: true });
+  const r = document.createRange(); r.selectNode(el); const sl = getSelection(); sl.removeAllRanges(); sl.addRange(r);
+  document.execCommand("delete");
+  if (ED.doc.contains(el)) el.remove();
+  ensureTrail(ED.doc); onDocChange();
+  toast("Moodboard removido da nota — Ctrl+Z traz de volta");
+}
+function embedToList(n, b) {
+  const now = Date.now();
+  const c = { id: uid("nt_"), nb: n.nb && S.nbs.has(n.nb) ? n.nb : defaultNb(), kind: "moodboard", title: (b.title || "").trim() || titleOf(n) + " · moodboard", board: cloneBoardFresh(b), html: "", text: "Moodboard", tags: [], prio: 0, stage: "", reminder: null, reminderDone: false, fav: false, trashed: false, created: now, updated: now };
+  delete c.board.title;
+  S.notes.set(c.id, c); markNote(c.id); renderSidebar(); renderList();
+  toast("Cópia criada na lista de notas", { label: "Abrir", run: () => openNote(c.id, { newTab: true }) });
+}
+function boardPickerForNote() {
+  if (!ED || ED.doc.contentEditable !== "true") return;
+  const nid = ED.id;
+  moodboardPicker({ onPick: (board, o) => { if (ED && ED.id === nid) insertBoardEmbed(board, !o.copy); } });
+}
+function insertBoardEmbed(board, open) {
+  if (!ED || ED.doc.contentEditable !== "true") return;
+  const n = S.notes.get(ED.id); if (!n) return;
+  const bid = uid("bd_");
+  n.boards = n.boards || {}; n.boards[bid] = mbMigrate(board);
+  ED.doc.focus({ preventScroll: true }); restoreSel();
+  const sl = getSelection();
+  if (!sl.rangeCount || !ED.doc.contains(sl.anchorNode)) { const r = document.createRange(); r.selectNodeContents(ED.doc); r.collapse(false); sl.removeAllRanges(); sl.addRange(r); }
+  const inBlock = selEl()?.closest("li,h1,h2,h3,blockquote,pre,td,th,.callout");
+  if (inBlock) { let top = inBlock; while (top.parentNode && top.parentNode !== ED.doc) top = top.parentNode; const r = document.createRange(); r.setStartAfter(top); r.collapse(true); sl.removeAllRanges(); sl.addRange(r); }
+  const cb = selEl()?.closest("p,div,h1,h2,h3,blockquote,li");
+  document.execCommand("insertHTML", false, `<div class="mb-embed" contenteditable="false" data-board="${bid}"></div><p id="fnNew"><br></p>`);
+  if (cb && cb.tagName === "P" && cb.parentNode === ED.doc && !cb.textContent.trim() && !cb.querySelector("img,.mb-embed")) cb.remove();
+  let el = ED.doc.querySelector(`.mb-embed[data-board="${bid}"]`);
+  if (!el) { // o navegador não aceitou o bloco onde estava o cursor: coloca no fim
+    el = document.createElement("div"); el.className = "mb-embed"; el.setAttribute("contenteditable", "false"); el.setAttribute("data-board", bid);
+    ED.doc.appendChild(el); const p = document.createElement("p"); p.id = "fnNew"; p.innerHTML = "<br>"; ED.doc.appendChild(p);
+  }
+  hydrateEmbeds(ED.doc, bid);
+  el.classList.add("mbe-born"); setTimeout(() => el.classList.remove("mbe-born"), 700);
+  const np = $("#fnNew"); if (np) { np.removeAttribute("id"); caretAt(np); }
+  onDocChange();
+  if (open) setTimeout(() => openBoardSheet(n.id, bid), 260);
+  else toast("Moodboard copiado para a nota");
+}
+
+/* folha em tela cheia */
+function openBoardSheet(nid, bid) {
+  const n = S.notes.get(nid); if (!n || !getBoard(n, bid)) return;
+  closePop();
+  if (ED && ED.id === nid) saveSel();
+  let sh = $("#mbSheet"); if (sh) sh.remove();
+  sh = document.createElement("div"); sh.id = "mbSheet"; sh.className = "mb-sheet"; sh.setAttribute("role", "dialog"); sh.setAttribute("aria-label", "Editar moodboard");
+  sh.innerHTML = `<div class="mb-sheet-in" id="mbSheetIn" tabindex="-1"></div>`;
+  const ae = document.activeElement; if (ae && ae !== document.body && ae.blur) ae.blur();
+  document.body.appendChild(sh);
+  if (BRD && BRD.ro) BRD.ro.disconnect();
+  BRD = null;
+  renderBoard(n, { host: $("#mbSheetIn"), bid });
+  sh.addEventListener("click", (e) => { const b = e.target.closest("[data-mbs]"); if (!b) return; if (b.dataset.mbs === "close") closeBoardSheet(); else if (b.dataset.mbs === "export") mbExport(nid); });
+  $("#mbSheetIn").focus({ preventScroll: true });
+  requestAnimationFrame(() => requestAnimationFrame(() => sh.classList.add("show")));
+  try { history.pushState({ fn: "mbsheet" }, ""); } catch (e) {}
+}
+function closeBoardSheet(fromPop) {
+  const sh = $("#mbSheet");
+  if (!sh) return;
+  let nid = null, bid = null;
+  if (BRD && BRD.bid) {
+    if (BRD.editing) endTextEdit(); if (BRD.crop) endCrop(); if (BRD.pick) mbPickEnd();
+    nid = BRD.id; bid = BRD.bid;
+    clearTimeout(mbSoftT);
+    const n = mbNote(); if (n && BRD.soft) mbSave(n);
+    if (BRD.ro) BRD.ro.disconnect();
+    BRD = null;
+  }
+  closePop();
+  sh.id = ""; sh.classList.remove("show"); sh.classList.add("closing");
+  setTimeout(() => sh.remove(), 280);
+  if (!fromPop && history.state && history.state.fn === "mbsheet") { SHEET_POP_SKIP = true; history.back(); }
+  if (ED && ED.id === nid) {
+    hydrateEmbeds(ED.doc, bid);
+    const el = ED.doc.querySelector(`.mb-embed[data-board="${bid}"]`);
+    if (el) { el.classList.add("mbe-fresh"); setTimeout(() => el.classList.remove("mbe-fresh"), 900); }
+  }
+}
+
+/* sempre existe uma linha para escrever depois de imagens, moodboards, divisores e áudios */
+function isTextBlock(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (el.matches(".mb-embed,.audio-block,hr,img,table,figure")) return false;
+  if (el.matches("p,div") && !el.textContent.trim() && el.querySelector("img,video,.mb-embed")) return false;
+  return true;
+}
+function ensureTrail(doc) {
+  if (!doc || doc.contentEditable !== "true") return;
+  const last = doc.lastElementChild;
+  if (!last || isTextBlock(last)) return;
+  const p = document.createElement("p"); p.innerHTML = "<br>"; doc.appendChild(p);
+}
+
+function caretAt(el, end) { const r = document.createRange(); r.selectNodeContents(el); r.collapse(!end); const sl = getSelection(); sl.removeAllRanges(); sl.addRange(r); saveSel(); }
+
+/* =========================================================
+   Imagens das notas na nuvem (Supabase Storage, privadas)
+   PC: o arquivo fica na pasta de anexos e sobe uma vez; se faltar, o app baixa sozinho.
+   Celular: a imagem fica guardada no aparelho (funciona offline) e sobe quando der.
+   ========================================================= */
+const IMG_BUCKET = "imagens";
+const IMG_BLANK = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+const IMGS = { url: new Map(), wait: new Map(), busy: false, warned: false };
+const anexoName = (src) => { const m = /^anexo:\/\/img\/([\w.-]+)$/i.exec(src || ""); return m ? m[1] : null; };
+/* celular: troca o endereço local pelo marcador antes de a nota ir para a tela (o navegador não conhece anexo://) */
+const webImgHTML = (h) => (WEB && h && h.includes("anexo://img/") ? h.replace(/(<img\b[^>]*?)\ssrc="anexo:\/\/img\/([\w.-]+)"/gi, (m, a, nm) => `${a} src="${IMG_BLANK}" data-anexo="${nm}"`) : h);
+function dataUrlToBlob(d) {
+  const m = /^data:([^;,]+)(;base64)?,(.*)$/s.exec(d || ""); if (!m) return null;
+  const bin = m[2] ? atob(m[3]) : decodeURIComponent(m[3]), u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return new Blob([u], { type: m[1] });
+}
+const blobToDataUrl = (b) => new Promise((res) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => res(null); fr.readAsDataURL(b); });
+
+/* banco local do navegador (celular) */
+let IDBP = null;
+function idb() {
+  if (!IDBP) IDBP = new Promise((res, rej) => {
+    try { const r = indexedDB.open("fn-imgs", 1); r.onupgradeneeded = () => { const d = r.result; if (!d.objectStoreNames.contains("blobs")) d.createObjectStore("blobs"); if (!d.objectStoreNames.contains("pending")) d.createObjectStore("pending"); }; r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }
+    catch (e) { rej(e); }
+  });
+  return IDBP;
+}
+async function idbDo(store, mode, fn) {
+  try { const d = await idb(); return await new Promise((res) => { const tx = d.transaction(store, mode), q = fn(tx.objectStore(store)); tx.oncomplete = () => res(q ? q.result : undefined); tx.onerror = () => res(undefined); tx.onabort = () => res(undefined); }); }
+  catch (e) { return undefined; }
+}
+const idbGet = (st, k) => idbDo(st, "readonly", (o) => o.get(k));
+const idbPut = (st, k, v) => idbDo(st, "readwrite", (o) => o.put(v, k));
+const idbDel = (st, k) => idbDo(st, "readwrite", (o) => o.delete(k));
+const idbKeys = (st) => idbDo(st, "readonly", (o) => o.getAllKeys());
+
+/* celular: guarda a imagem no aparelho e devolve o nome (a nota guarda anexo://img/nome, igual ao PC) */
+async function webSaveImage(dataUrl) {
+  const m = /^data:image\/(png|jpeg|jpg|gif|webp);base64,/i.exec(dataUrl || ""); if (!m) return dataUrl;
+  const ext = m[1].toLowerCase() === "jpeg" ? "jpg" : m[1].toLowerCase();
+  const name = Date.now().toString(36) + Math.random().toString(36).slice(2, 8) + "." + ext;
+  const blob = dataUrlToBlob(dataUrl); if (!blob) return dataUrl;
+  const ok = await idbPut("blobs", name, blob);
+  const chk = await idbGet("blobs", name);
+  if (!chk) return dataUrl; // aparelho sem armazenamento disponível: a imagem continua embutida na nota
+  await idbPut("pending", name, 1);
+  IMGS.url.set(name, URL.createObjectURL(blob));
+  imgSyncSoon(800);
+  return name;
+}
+
+/* encontra a imagem: memória → aparelho → nuvem */
+async function resolveImg(name) {
+  if (IMGS.url.has(name)) return IMGS.url.get(name);
+  if (IMGS.wait.has(name)) return IMGS.wait.get(name);
+  const p = (async () => {
+    let blob = await idbGet("blobs", name);
+    if (!blob && SB && CLOUD.user && navigator.onLine !== false) {
+      try { const { data, error } = await SB.storage.from(IMG_BUCKET).download(CLOUD.user.id + "/" + name); if (!error && data && data.size) { blob = data; idbPut("blobs", name, blob); } } catch (e) {}
+    }
+    if (!blob) return null;
+    const u = URL.createObjectURL(blob); IMGS.url.set(name, u); return u;
+  })();
+  IMGS.wait.set(name, p);
+  const r = await p; IMGS.wait.delete(name);
+  return r;
+}
+/* as imagens da nota/lista aparecem (no celular troca o endereço local pelo arquivo guardado) */
+function hydrateImgs(root) {
+  if (!root) return;
+  root.querySelectorAll('img[src^="anexo://img/"], img[data-anexo]').forEach((img) => {
+    const name = img.getAttribute("data-anexo") || anexoName(img.getAttribute("src")); if (!name) return;
+    if (!WEB) {
+      if (!img._fnErr) {
+        img._fnErr = true; img._fnTries = 0;
+        img.addEventListener("error", () => {
+          if (img.src === IMG_BLANK) return;
+          img.classList.add("img-miss");
+          if (++img._fnTries > 6) return;
+          setTimeout(() => { if (img.isConnected) { img.setAttribute("data-anexo", name); img.src = "anexo://img/" + name + "?r=" + Date.now(); } }, 8000 * img._fnTries);
+        });
+        img.addEventListener("load", () => img.classList.remove("img-miss"));
+      }
+      return;
+    }
+    img.setAttribute("data-anexo", name);
+    const u = IMGS.url.get(name);
+    if (u) { if (img.getAttribute("src") !== u) img.src = u; img.classList.remove("img-wait", "img-miss"); return; }
+    if (!img.classList.contains("img-wait")) { img.src = IMG_BLANK; img.classList.add("img-wait"); }
+    resolveImg(name).then((url) => {
+      if (!img.isConnected) return;
+      if (url) { img.src = url; img.classList.remove("img-wait", "img-miss"); }
+      else { img.classList.remove("img-wait"); img.classList.add("img-miss"); }
+    });
+  });
+}
+function retryMissingImgs() {
+  if (!WEB) return;
+  const list = [...$$("img.img-miss[data-anexo]")]; if (!list.length) return;
+  list.forEach((i) => i.classList.remove("img-miss"));
+  hydrateImgs(document.body);
+}
+/* dado da imagem (para o link compartilhado) */
+async function imageDataFor(name) {
+  if (!WEB) return api.imageData ? api.imageData(name) : null;
+  const u = await resolveImg(name); if (!u) return null;
+  try { return await blobToDataUrl(await (await fetch(u)).blob()); } catch (e) { return null; }
+}
+
+/* envio para a nuvem: PC manda as imagens das notas (inclusive as antigas); celular manda as pendentes */
+const imgDoneKey = (u) => "fn-img-up:" + u;
+function imgDoneSet(u) { try { return new Set(JSON.parse(localStorage.getItem(imgDoneKey(u)) || "[]")); } catch (e) { return new Set(); } }
+function imgDoneSave(u, set) { try { localStorage.setItem(imgDoneKey(u), JSON.stringify([...set])); } catch (e) {} }
+function allAnexoNames() {
+  const out = new Set(), add = (h) => { for (const m of String(h || "").matchAll(/anexo:\/\/img\/([\w.-]+)/g)) out.add(m[1]); };
+  S.notes.forEach((n) => add(n.html));
+  myTemplates().forEach((t) => add(t.html));
+  return [...out];
+}
+let imgSyncT = 0;
+function imgSyncSoon(ms = 1500) { clearTimeout(imgSyncT); imgSyncT = setTimeout(imgSync, ms); }
+function imgUploadErr(err) {
+  const m = ((err && (err.message || err.error)) || "") + " " + ((err && (err.statusCode || err.status)) || "");
+  if (IMGS.warned) return;
+  if (/bucket not found|not found|row-level security|violates|403|404|unauthorized/i.test(m)) {
+    IMGS.warned = true;
+    toast("Para as imagens aparecerem no celular, falta ligar o armazenamento no Supabase (um código rápido — me peça)");
+  }
+}
+async function imgSync() {
+  if (IMGS.busy || !SB || !CLOUD.user || navigator.onLine === false) return;
+  IMGS.busy = true;
+  const uid = CLOUD.user.id;
+  try {
+    const done = WEB ? null : imgDoneSet(uid);
+    const names = WEB ? ((await idbKeys("pending")) || []) : allAnexoNames().filter((x) => !done.has(x));
+    let n = 0;
+    for (const name of names) {
+      if (!CLOUD.user || CLOUD.user.id !== uid || navigator.onLine === false) break;
+      let blob = null;
+      if (WEB) blob = await idbGet("blobs", name);
+      else { const d = await api.imageData(name); blob = d ? dataUrlToBlob(d) : null; }
+      if (!blob) { if (WEB) await idbDel("pending", name); else done.add(name); continue; }
+      const { error } = await SB.storage.from(IMG_BUCKET).upload(uid + "/" + name, blob, { contentType: blob.type || "image/jpeg", cacheControl: "31536000", upsert: false });
+      const exists = error && /exist|duplicate|409/i.test(((error.message || error.error || "") + " " + (error.statusCode || "")));
+      if (error && !exists) { imgUploadErr(error); break; }
+      if (WEB) await idbDel("pending", name); else { done.add(name); if (++n % 5 === 0) imgDoneSave(uid, done); }
+    }
+    if (!WEB) imgDoneSave(uid, done);
+  } catch (e) {}
+  finally { IMGS.busy = false; }
+}
+/* PC: passa a chave da sessão para o app conseguir baixar imagens que vieram do celular */
+function sendCloudCreds(session) {
+  if (WEB || !api.cloudCreds) return;
+  try { api.cloudCreds(session && session.access_token && session.user ? { url: SUPA_URL, key: SUPA_KEY, token: session.access_token, uid: session.user.id } : null); } catch (e) {}
+}
+setInterval(() => { if (!document.hidden && CLOUD.user) { imgSyncSoon(200); retryMissingImgs(); } }, 60000);
 
 async function init() {
   const d = await api.load();
