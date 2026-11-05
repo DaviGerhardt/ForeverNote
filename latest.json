@@ -1,4 +1,4 @@
 {
-  "version": "2.9.1",
-  "notes": "Corrigido: imagens e moodboards dentro da nota piscavam ou sumiam por alguns segundos enquanto você digitava ou quando chegava uma alteração do outro aparelho.\nTudo da 2.9: moodboard dentro da nota, imagens no celular, colar de pastas e linha depois da imagem."
+  "version": "2.9.2",
+  "notes": "Corrigido: fotos e textos do moodboard dentro da nota sumiam e voltavam conforme o mouse passava por cima (itens mandados para trás).\nTudo da 2.9: moodboard dentro da nota, imagens no celular, colar de pastas e linha depois da imagem."
 }

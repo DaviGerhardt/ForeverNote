@@ -1426,7 +1426,7 @@ html.mobile .app.tplmode .fab,html.mobile .list.picking .fab{display:none}
    ========================================================= */
 .doc .mb-embed{position:relative;margin:16px 0 8px;border-radius:16px;user-select:none;-webkit-user-select:none;cursor:pointer;outline:none;caret-color:transparent}
 .doc .mb-embed .mbe-view{display:flex;justify-content:center;padding:16px;background:var(--sunken);border:1px solid var(--line-soft);border-bottom:0;border-radius:16px 16px 0 0;transition:background .25s var(--ease)}
-.doc .mbe-canvas{position:relative;width:min(100%,calc(62vh / var(--R)));max-width:620px;container-type:inline-size;border-radius:10px;overflow:hidden;box-shadow:0 14px 34px -14px rgba(0,0,0,.38),0 1px 3px rgba(0,0,0,.12);transition:transform .45s var(--spring),box-shadow .35s var(--ease)}
+.doc .mbe-canvas{position:relative;isolation:isolate;width:min(100%,calc(62vh / var(--R)));max-width:620px;container-type:inline-size;border-radius:10px;overflow:hidden;box-shadow:0 14px 34px -14px rgba(0,0,0,.38),0 1px 3px rgba(0,0,0,.12);transition:transform .45s var(--spring),box-shadow .35s var(--ease)}
 .doc .mb-embed:hover .mbe-canvas{transform:translateY(-2px) scale(1.006);box-shadow:0 22px 44px -16px rgba(0,0,0,.42),0 2px 6px rgba(0,0,0,.12)}
 .doc .mbe-i,.doc .mbe-c,.doc .mbe-t{position:absolute;box-sizing:border-box}
 .doc .mbe-i{overflow:hidden;background:rgba(127,127,127,.08)}
@@ -1486,3 +1486,5 @@ html.mobile .mbs-top .mbs-back span,html.mobile .mbs-crumb>span:first-child,html
 @keyframes imgWait{from{background-position:120% 0}to{background-position:-120% 0}}
 
 .mb-sheet~.pop,.mb-sheet~.pop.sub{z-index:47}
+
+.mb-mini{isolation:isolate}
