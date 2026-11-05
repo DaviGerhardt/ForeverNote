@@ -1,4 +1,4 @@
 {
-  "version": "2.9.2",
-  "notes": "Corrigido: fotos e textos do moodboard dentro da nota sumiam e voltavam conforme o mouse passava por cima (itens mandados para trás).\nTudo da 2.9: moodboard dentro da nota, imagens no celular, colar de pastas e linha depois da imagem."
+  "version": "2.9.3",
+  "notes": "Redimensionar a foto pelo canto agora aumenta/diminui a foto inteira, sem cortar (Shift deixa livre; as laterais ajustam o recorte).\nCorrigido: a folha do moodboard podia ficar mudando de tamanho sem parar em alguns celulares.\nO editor do moodboard da nota fecha sozinho ao trocar de nota."
 }

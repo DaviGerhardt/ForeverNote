@@ -2416,6 +2416,7 @@ addEventListener("popstate", () => {
 });
 function openNote(id, o = {}) {
   if (!S.notes.has(id)) return;
+  if ($("#mbSheet") && BRD && BRD.bid && BRD.id !== id) closeBoardSheet();
   if (TPLED && id !== TPLED.id) endTplEdit(true);
   if (S.sel.type === "tpl") { S.sel = { type: "all" }; renderSidebar(); renderList(true); saveSession(); }
   rememberScroll();
@@ -4610,7 +4611,7 @@ function startResize(e, hd) {
         if (hasS) { const p = near(Bb, T.h, ty); if (p != null) { Bb = p; g.push({ o: "h", p }); } }
       }
     }
-    const keep = it.type === "color" || (it.type === "text" && corner) || (it.type === "image" && corner && ev.shiftKey);
+    const keep = it.type === "color" || (it.type === "text" && corner) || (it.type === "image" && corner && !ev.shiftKey);
     if (keep) {
       const kx = (Rr - L) / Math.max(0.01, R0 - L0), ky = hasN || hasS ? (Bb - Tt) / Math.max(0.01, B0 - T0) : kx;
       let k = it.type === "text" ? kx : Math.abs(kx - 1) >= Math.abs(ky - 1) ? kx : ky;
@@ -4691,10 +4692,14 @@ function mbFit(force) {
   const st = $("#mbStage"); if (!st || !BRD) return;
   const b = mbBoard(); if (!b) return;
   const R = b.ratio || 1.25, mob = mqMobile.matches;
-  const aw = st.clientWidth - (mob ? 28 : 80), ah = st.clientHeight - (mob ? 110 : 154);
+  const aw = st.offsetWidth - (mob ? 28 : 80) - 16, ah = st.offsetHeight - (mob ? 110 : 154) - 16;
   if (aw <= 0) return;
-  const base = clamp(mob ? aw : Math.min(aw, Math.max(ah / R, 320)), 160, 1000);
-  if (!force && Math.abs(base - BRD.base) < 1) return;
+  const base = Math.round(clamp(mob ? aw : Math.min(aw, Math.max(ah / R, 320)), 160, 1000));
+  if (!force && Math.abs(base - BRD.base) < 2) return;
+  // trava contra vai-e-volta (A→B→A em menos de 1 s): fica no menor e para
+  const now = performance.now(), h = (BRD.fitH = (BRD.fitH || []).filter((x) => now - x.t < 1000));
+  if (!force && h.length >= 2 && Math.abs(h[h.length - 2].b - base) < 2) { const m = Math.min(base, BRD.base); h.length = 0; if (Math.abs(m - BRD.base) >= 2) { BRD.base = m; applyView(); } return; }
+  h.push({ t: now, b: base });
   BRD.base = base; applyView();
 }
 function applyView() {
