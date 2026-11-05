@@ -1,4 +1,4 @@
 {
-  "version": "2.7.1",
-  "notes": "Novidade: Moodboards! Paineis visuais com fotos, paleta de cores e textos — crie pelo botao + da lista de notas (grades prontas ou em branco, arraste tudo, paleta automatica das fotos e exportar como imagem).\nSincronizacao mais robusta: o que voce editar sem internet agora sobe sozinho assim que a conexao volta."
+  "version": "2.8.0",
+  "notes": "Moodboard muito mais completo: desfazer/refazer, texto direto na folha, arrastar fotos da pasta, guias que centralizam e alinham, ajustar o enquadramento da foto, trocar fotos de lugar, formato da folha, espaçamento e cantos, seus próprios modelos e paleta inteligente com os códigos das cores.\nNovo: Compartilhar! Crie um link para alguém ver a nota ou o moodboard no navegador (WhatsApp, e-mail ou copiar link).\nO botão + agora cria moodboards; correção da dica que aparecia por cima da imagem."
 }

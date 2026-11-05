@@ -297,6 +297,16 @@ ipcMain.handle("folder:open", (e, which) => {
   return shell.openPath(p);
 });
 ipcMain.handle("link:open", (e, url) => openExternal(url));
+ipcMain.handle("image:dataurl", async (e, name) => {
+  try {
+    const file = path.join(D.images(), path.basename(String(name || "")));
+    const ext = path.extname(file).slice(1).toLowerCase();
+    const type = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" }[ext];
+    if (!type) return null;
+    const buf = await fs.promises.readFile(file);
+    return "data:" + type + ";base64," + buf.toString("base64");
+  } catch (err) { return null; }
+});
 ipcMain.handle("win:fullscreen", (e, on) => { if (win) win.setFullScreen(!!on); return win ? win.isFullScreen() : false; });
 ipcMain.handle("win:reload", (e) => { e.sender.reload(); return true; });
 ipcMain.handle("win:focus", () => { if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); } });

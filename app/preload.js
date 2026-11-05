@@ -49,5 +49,6 @@ contextBridge.exposeInMainWorld("api", {
   installUpdate: (info) => inv("update:install", info),
   onUpdateAvailable: (cb) => ipcRenderer.on("update:available", (e, v) => cb(v)),
   onUpdateProgress: (cb) => ipcRenderer.on("update:progress", (e, v) => cb(v)),
+  imageData: (name) => inv("image:dataurl", name),
   appVersion: () => { try { return ipcRenderer.sendSync("app:version"); } catch (e) { return ""; } }
 });

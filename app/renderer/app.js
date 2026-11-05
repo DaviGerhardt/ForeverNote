@@ -69,7 +69,7 @@ const S = {
   filter: blankFilter(),
   tabs: [], active: null, hist: [], histPos: -1,
   expanded: false, fullscreen: false, closed: {}, scroll: {},
-  prefs: { theme: "system", autocap: true, spell: true, autolink: true, font: "", size: 16, wide: false, zoom: 1, anim: true, micId: "", lang: "pt", afterRec: "ask", hints: true, proofOnline: null, myWords: [], closeToTray: true, minToTray: true, startLogin: false, wpm: 150, templates: [] },
+  prefs: { theme: "system", autocap: true, spell: true, autolink: true, font: "", size: 16, wide: false, zoom: 1, anim: true, micId: "", lang: "pt", afterRec: "ask", hints: true, proofOnline: null, myWords: [], closeToTray: true, minToTray: true, startLogin: false, wpm: 150, templates: [], boardTpls: [], sysUpd: 0, webBase: "" },
   dataDir: "", platform: "", nbUpdated: 0,
   picked: new Set(), pickMode: false, lastPick: null
 };
@@ -626,7 +626,9 @@ async function cloudOnLogin() {
       SB.from("notebooks").select("list,updated").maybeSingle()
     ]);
     if (notesRes.error) throw notesRes.error;
-    const rnotes = notesRes.data || [], rnb = nbRes.data;
+    const all = notesRes.data || [], rnb = nbRes.data;
+    const sysRow = all.find((r) => r.id === SYS_ID), rnotes = all.filter((r) => r.id !== SYS_ID);
+    if (sysRow) applySysRow(sysRow);
     const remote = new Map(rnotes.map((r) => [r.id, r]));
     rnotes.forEach((r) => {
       const loc = S.notes.get(r.id);
@@ -641,7 +643,10 @@ async function cloudOnLogin() {
     S.notes.forEach((n) => { const r = remote.get(n.id); if (!r || (n.updated || 0) > (r.updated || 0)) push.push(n); });
     if (push.length) await cloudPushNotes(push);
     if (!rnb || localNbUpd >= (rnb.updated || 0)) await cloudPushNotebooks();
-    let maxU = 0; rnotes.forEach((r) => { if ((r.updated || 0) > maxU) maxU = r.updated; });
+    if (WEB && /^https:$/.test(location.protocol) && S.prefs.webBase !== shareBase()) S.prefs.webBase = shareBase();
+    const sysLocal = S.prefs.sysUpd || 0, sysRemote = sysRow ? sysRow.updated || 0 : 0;
+    if (sysLocal > sysRemote || (WEB && sysRow && (sysRow.data || {}).webBase !== S.prefs.webBase) || (!sysRow && ((S.prefs.boardTpls || []).length || S.prefs.webBase))) sysPush();
+    let maxU = 0; all.forEach((r) => { if ((r.updated || 0) > maxU) maxU = r.updated; });
     CLOUD.lastPull = Math.max(maxU, rnb ? (rnb.updated || 0) : 0);
     if (CLOUD.pend) CLOUD.pend.clear(); if (CLOUD.pendDel) CLOUD.pendDel.clear(); CLOUD.pendNb = false;
     saveLocalAll(); renderAll(true); cloudSubscribe(); cloudStartPoll();
@@ -682,6 +687,7 @@ async function cloudDeleteNotes(ids) {
   if (!SB || !CLOUD.user || !ids.length) return;
   const rows = ids.map((id) => ({ id, user_id: CLOUD.user.id, data: {}, updated: Date.now(), deleted: true }));
   await SB.from("notes").upsert(rows, { onConflict: "user_id,id" });
+  try { await SB.from("shares").delete().in("note_id", ids); } catch (e) {}
 }
 async function cloudPushNotebooks() {
   if (!SB || !CLOUD.user) return;
@@ -703,7 +709,7 @@ function cloudSync(ids, dels, nb) {
       if (navigator.onLine === false) throw new Error("offline");
       CLOUD.state = "syncing"; refreshSyncUI();
       const notes = ids.map((id) => S.notes.get(id)).filter(Boolean);
-      if (notes.length) await cloudPushNotes(notes);
+      if (notes.length) { await cloudPushNotes(notes); notes.forEach((n) => { if (n.share && n.share.id) shareRefreshSoon(n.id); }); }
       if (dels && dels.length) await cloudDeleteNotes(dels);
       if (nb) await cloudPushNotebooks();
       CLOUD.state = "ok";
@@ -718,7 +724,7 @@ async function cloudFlushPending() {
   try {
     CLOUD.state = "syncing"; refreshSyncUI();
     const notes = ids.map((id) => S.notes.get(id)).filter(Boolean);
-    if (notes.length) await cloudPushNotes(notes);
+    if (notes.length) { await cloudPushNotes(notes); notes.forEach((n) => { if (n.share && n.share.id) shareRefreshSoon(n.id); }); }
     if (dels.length) await cloudDeleteNotes(dels);
     if (nb) await cloudPushNotebooks();
     if (CLOUD.pend) CLOUD.pend.clear(); if (CLOUD.pendDel) CLOUD.pendDel.clear(); CLOUD.pendNb = false;
@@ -754,8 +760,12 @@ function editorBusy() {
 }
 function applyRemoteNote(r) {
   if (!r || !r.id) return false;
-  const isOpen = ED && ED.id === r.id;
-  if (isOpen && editorBusy()) return false;
+  if (r.id === SYS_ID) return applySysRow(r);
+  const boardOpen = typeof mbActive === "function" && mbActive() && BRD.id === r.id;
+  const isOpen = (ED && ED.id === r.id) || boardOpen;
+  if (ED && ED.id === r.id && editorBusy()) return false;
+  if (boardOpen && boardBusy(r.id)) return false;
+  if (boardOpen) HIST.delete(r.id);
   const loc = S.notes.get(r.id);
   if (r.deleted) { if (loc) { S.notes.delete(r.id); if (isOpen) pendingOpenChanged = true; return true; } return false; }
   if (!loc || (r.updated || 0) > (loc.updated || 0)) { const n = { ...r.data, id: r.id }; n.tags = n.tags || []; S.notes.set(r.id, n); if (isOpen) pendingOpenChanged = true; return true; }
@@ -769,6 +779,7 @@ function afterRemote() {
     const oc = pendingOpenChanged; pendingOpenChanged = false;
     if (ED && !S.notes.has(ED.id)) { const i = S.tabs.indexOf(ED.id); if (i >= 0) S.tabs.splice(i, 1); S.active = S.tabs.find((t) => S.notes.has(t)) || null; renderTabs(); renderPane(); }
     else if (oc && ED) { renderPane({ keepScroll: $("#edScroll") ? $("#edScroll").scrollTop : 0 }); }
+    else if (oc && BRD && S.active === BRD.id) { const st = $("#mbStage"), sl = st ? [st.scrollLeft, st.scrollTop] : null; if (S.notes.has(BRD.id)) renderPane(); else { const i = S.tabs.indexOf(BRD.id); if (i >= 0) S.tabs.splice(i, 1); S.active = S.tabs.find((t) => S.notes.has(t)) || null; renderTabs(); renderPane(); } const st2 = $("#mbStage"); if (st2 && sl) { st2.scrollLeft = sl[0]; st2.scrollTop = sl[1]; } }
     renderSidebar(); renderList(false, true);
   }, 150);
 }
@@ -1156,7 +1167,7 @@ function renderTabs() {
   S.tabs = S.tabs.filter((id) => S.notes.has(id));
   $("#tabs").innerHTML = S.tabs.map((id) => {
     const n = S.notes.get(id);
-    return `<div class="tab${id === S.active ? " on" : ""}" role="tab" tabindex="0" aria-selected="${id === S.active}" data-tab="${id}" title="${esc(titleOf(n))}">${ic("notes")}<span class="tl">${esc(titleOf(n))}</span><button class="x" data-close="${id}" aria-label="Fechar aba">${ic("x")}</button></div>`;
+    return `<div class="tab${id === S.active ? " on" : ""}" role="tab" tabindex="0" aria-selected="${id === S.active}" data-tab="${id}" title="${esc(titleOf(n))}">${ic(n.kind === "moodboard" ? "board" : "notes")}<span class="tl">${esc(titleOf(n))}</span><button class="x" data-close="${id}" aria-label="Fechar aba">${ic("x")}</button></div>`;
   }).join("");
   $("#navBack").disabled = S.histPos <= 0;
   $("#navFwd").disabled = S.histPos >= S.hist.length - 1;
@@ -1239,6 +1250,7 @@ function renderPane(opts = {}) {
       </div>`}
       <span class="status-pill" id="edStatus">${ic("check")}Salvo</span>
       ${n.tplEdit ? "" : `<button class="ib star${n.fav ? " on" : ""}" data-act="fav" title="Favoritar" aria-label="Favoritar">${ic("star")}</button>
+      ${shareBtnsHTML(n)}
       <button class="ib" data-act="notemenu" title="Mais opções" aria-label="Mais opções">${ic("more")}</button>`}
     </div>
     ${n.tplEdit ? `<div class="tpl-banner">${ic("template")}<span><b>Editando modelo.</b> Tudo é salvo sozinho. O que estiver aqui aparece em cada nota nova criada com ele.</span><button class="btn primary" data-act="tpldone">${ic("check")}Concluir</button></div>` : ""}
@@ -2442,6 +2454,8 @@ function duplicateNote(id) {
   const n = S.notes.get(id); if (!n) return;
   const now = Date.now();
   const c = { ...n, id: uid("nt_"), title: (n.title || "Sem título") + " (cópia)", tags: [...(n.tags || [])], created: now, updated: now, reminder: null, reminderDone: false };
+  delete c.share;
+  if (n.kind === "moodboard" && n.board) c.board = cloneBoardFresh(n.board);
   S.notes.set(c.id, c); markNote(c.id); renderList(); renderSidebar(); openNote(c.id); toast("Nota duplicada");
 }
 function moveNote(id, nbId) {
@@ -2503,7 +2517,22 @@ function tagMenu(btn, tag) {
 function noteMenu(btn) {
   const n = S.notes.get(S.active); if (!n) return;
   if (n.trashed) return menu(btn, [{ icon: "restore", label: "Restaurar", run: () => restoreNote(n.id) }, { icon: "trash", label: "Excluir para sempre", danger: true, run: () => purgeNote(n.id) }], { right: true });
+  if (n.kind === "moodboard") return menu(btn, [
+    { icon: "share", label: "Compartilhar…", run: () => shareModal(n.id) },
+    { icon: "download", label: "Baixar como imagem", run: () => mbExport(n.id) },
+    { icon: "copy", label: "Copiar como imagem", run: () => mbCopyImage(n) },
+    "-",
+    { icon: "book", label: "Mover para…", keep: true, run: () => moveMenu(btn, n.id) },
+    { icon: "dup", label: "Duplicar moodboard", run: () => duplicateNote(n.id) },
+    { icon: "template", label: "Salvar como modelo…", run: () => { if (mbActive()) mbSaveTemplate(); } },
+    "-",
+    { label: "Criado " + fmtDate(n.created, true), icon: "calendar", run: () => {} },
+    "-",
+    { icon: "trash", label: "Mover para a lixeira", danger: true, run: () => trashNote(n.id) }
+  ], { right: true });
   menu(btn, [
+    { icon: "share", label: "Compartilhar…", run: () => shareModal(n.id) },
+    "-",
     { icon: "book", label: "Mover para…", keep: true, run: () => moveMenu(btn, n.id) },
     { icon: "dup", label: "Duplicar nota", run: () => duplicateNote(n.id) },
     { icon: "template", label: "Salvar como modelo…", run: () => saveAsTemplate(n.id) },
@@ -2833,8 +2862,16 @@ function updateLineHint() {
   const el = selEl(); const b = el && el !== ED.doc ? el.closest("p,h1,h2,h3,li,div:not(.callout):not(.audio-block)") : null;
   if (!b || b.textContent.replace(/\u200b/g, "").length || b.querySelector("img,.audio-block,table,hr") || b.closest("pre,td,th") || b.hasAttribute("data-ph")) return hideLineHint();
   const page = h.parentNode.getBoundingClientRect(), r = b.getBoundingClientRect(), cs = getComputedStyle(b);
-  h.style.top = (r.top - page.top + (parseFloat(cs.paddingTop) || 0)) + "px";
-  h.style.left = (r.left - page.left + (parseFloat(cs.paddingLeft) || 0)) + "px";
+  // linha vazia sem altura (ex.: um <p> vazio colado numa imagem) não mostra a dica
+  const lh = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.4 || 20;
+  if (r.height < lh * 0.6 || r.width < 40) return hideLineHint();
+  const top = r.top + (parseFloat(cs.paddingTop) || 0), left = r.left + (parseFloat(cs.paddingLeft) || 0);
+  // nunca por cima de imagem, áudio, tabela ou divisória
+  const box = { l: left, t: top, r: left + Math.min(r.width, 440), b: top + lh };
+  const hit = [...ED.doc.querySelectorAll("img,.audio-block,table,hr,pre,video,iframe")].some((x) => { const q = x.getBoundingClientRect(); return q.width && q.height && q.left < box.r && q.right > box.l && q.top < box.b && q.bottom > box.t; });
+  if (hit) return hideLineHint();
+  h.style.top = (top - page.top) + "px";
+  h.style.left = (left - page.left) + "px";
   h.style.maxWidth = Math.max(80, r.width - 8) + "px"; h.style.lineHeight = cs.lineHeight; h.style.fontSize = cs.fontSize;
   h.classList.add("show");
 }
@@ -3342,7 +3379,10 @@ document.addEventListener("click", async (e) => {
   if (b.dataset.crumb === "stack") { const nb = S.nbs.get(S.notes.get(S.active)?.nb); if (nb) setSel({ type: "stack", id: nb.stack }); return; }
   switch (b.dataset.act || b.id) {
     case "new": case "sideNew": case "tabAdd": newNote(); break;
-    case "listNew": menu(b, [{ icon: "note-add", label: "Nova nota", k: "Ctrl+N", run: () => newNote() }, { icon: "board", label: "Novo moodboard", run: () => moodboardPicker() }], { right: true }); break;
+    case "listNew": moodboardPicker(); break;
+    case "share": shareModal(S.active); break;
+    case "sharelink": shareQuickLink(S.active); break;
+    case "mbexport": mbExport(S.active); break;
     case "sideNewNb": case "secNewNb": newNotebook(); break;
     case "sideSettings": settingsModal(); break;
     case "listFilter": filterModal(); break;
@@ -3681,189 +3721,57 @@ function welcomeNote(nbId) {
    Moodboard: painel visual (fotos, cores, textos)
    ========================================================= */
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-const boardFontCss = (f) => ({ serif: "Lora, Georgia, serif", slab: "'Roboto Slab', serif", script: "'Dancing Script', cursive", hand: "Caveat, 'Segoe Print', cursive" }[f] || "var(--ui)");
-const BOARD_FONTS = [["", "Padrão"], ["serif", "Serif"], ["slab", "Slab"], ["script", "Script"], ["hand", "À mão"]];
-const BOARD_RATIOS = [["Retrato", 1.25], ["Quadrado", 1], ["Paisagem", 0.7], ["Story", 1.78]];
-function blankBoard() { return { bg: "#faf6f4", ratio: 1.25, items: [] }; }
-let BRD = null; // { id (note id), sel: itemId|null, drag:null }
+const r3 = (v) => Math.round(v * 1000) / 1000;
+const MB_UI = '"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif';
+const MB_FONTS = [["", "Padrão", "var(--ui)", MB_UI], ["serif", "Serif", "Lora, Georgia, serif"], ["slab", "Slab", "'Roboto Slab', Rockwell, serif"], ["script", "Script", "'Dancing Script', cursive"], ["hand", "À mão", "Caveat, 'Segoe Print', cursive"]];
+const boardFontCss = (f, forCanvas) => { const x = MB_FONTS.find((y) => y[0] === (f || "")) || MB_FONTS[0]; return forCanvas && x[3] ? x[3] : x[2]; };
+const MB_RATIOS = [["Retrato", "4:5", 1.25], ["Quadrado", "1:1", 1], ["Story", "9:16", 1.7778], ["Paisagem", "4:3", 0.75], ["A4", "folha", 1.4142]];
+const MB_SIZES = [1.6, 2, 2.4, 2.8, 3.2, 3.6, 4, 4.4, 4.8, 5.6, 6.4, 7.2, 8, 9.6, 11.2, 12.8, 14.4, 16, 19.2, 22.4];
+const MB_SWATCHES = ["#20151a", "#ffffff", "#f6d5cf", "#e9a7a0", "#d46a7e", "#c0304f", "#9e1b32", "#7a1f2b", "#f3e2d3", "#e8c9a0", "#c99a6a", "#a7703f", "#7b4a2d", "#4a2e22", "#efe3ea", "#cfa9c4", "#9a6b8f", "#e3e7ee", "#9aa7b8", "#2b2b2b"];
+const MB_BGS = ["#ffffff", "#faf6f4", "#f6efe9", "#f3e7df", "#f7ecef", "#eef0f4", "#eef1ea", "#e8e1d9", "#2a2224", "#1b1d22"];
+const PAL = { gap: 3, dmax: 13, margin: 2.6, label: 4.4 };   // medidas em % da largura da folha
+const PAL_DEF = ["#f3d9cf", "#e2b2a2", "#c98b7b", "#a45a5a", "#5b3a36"];
+function blankBoard() { return { v: 2, bg: "#faf6f4", ratio: 1.25, items: [] }; }
+let BRD = null;                 // editor aberto: { id, sel, view, base, ptrs, ... }
+const HIST = new Map();         // histórico de desfazer por moodboard
+let MBCLIP = null;              // item copiado (Ctrl+C)
 
-/* ---------- templates de grade ---------- */
-function gridCells(cols, rows, area, pad, rad) {
-  area = area || { x: 0, y: 0, w: 100, h: 100 }; pad = pad == null ? 2.2 : pad; rad = rad == null ? 10 : rad;
-  const items = [], gw = (area.w - pad * (cols + 1)) / cols, gh = (area.h - pad * (rows + 1)) / rows;
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) items.push({ id: uid("mb_"), type: "image", src: "", x: +(area.x + pad + c * (gw + pad)).toFixed(2), y: +(area.y + pad + r * (gh + pad)).toFixed(2), w: +gw.toFixed(2), h: +gh.toFixed(2), z: items.length, rad });
-  return items;
+/* ---------- utilidades de cor ---------- */
+const hex2rgb = (h) => { const m = /^#?([0-9a-f]{6})$/i.exec(h || ""); if (!m) return [200, 200, 200]; const n = parseInt(m[1], 16); return [n >> 16, (n >> 8) & 255, n & 255]; };
+const hexOf = (rgb) => "#" + rgb.map((v) => Math.round(clamp(v, 0, 255)).toString(16).padStart(2, "0")).join("");
+const lum = (h) => { const [r, g, b] = hex2rgb(h); return (0.299 * r + 0.587 * g + 0.114 * b) / 255; };
+function normHex(v) { v = String(v || "").trim().replace(/^#/, ""); if (/^[0-9a-f]{3}$/i.test(v)) v = v.split("").map((c) => c + c).join(""); return /^[0-9a-f]{6}$/i.test(v) ? "#" + v.toLowerCase() : null; }
+const hexLabelColor = (bg) => (lum(bg) > 0.55 ? "rgba(32,24,28,.68)" : "rgba(255,255,255,.78)");
+function copyText(txt, msg) {
+  const ok = () => toast(msg || "Copiado");
+  try { navigator.clipboard.writeText(txt).then(ok, fallback); } catch (e) { fallback(); }
+  function fallback() { const t = document.createElement("textarea"); t.value = txt; t.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(t); t.select(); try { document.execCommand("copy"); ok(); } catch (e) { toast("Não consegui copiar"); } t.remove(); }
 }
-function paletteRow(y, n, colors) {
-  const items = [], gap = 3, d = Math.min((100 - gap * (n + 1)) / n, 15), total = n * d + (n - 1) * gap, x0 = (100 - total) / 2;
-  for (let i = 0; i < n; i++) items.push({ id: uid("mb_"), type: "color", color: (colors && colors[i]) || "#e9c7c0", x: +(x0 + i * (d + gap)).toFixed(2), y, w: +d.toFixed(2), z: 50 + i, rad: 50 });
-  return items;
+const LIN = Array.from({ length: 256 }, (_, i) => { const c = i / 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); });
+function rgb2lab(r, g, b) {
+  const R = LIN[r], G = LIN[g], B = LIN[b];
+  const f = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const x = f((R * 0.4124 + G * 0.3576 + B * 0.1805) / 0.95047), y = f(R * 0.2126 + G * 0.7152 + B * 0.0722), z = f((R * 0.0193 + G * 0.1192 + B * 0.9505) / 1.08883);
+  return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
 }
-const BOARD_TEMPLATES = [
-  { id: "blank", name: "Em branco", desc: "Comece do zero", make: () => blankBoard() },
-  { id: "g22", name: "Grade 2 × 2", desc: "Quatro fotos", make: () => ({ bg: "#faf6f4", ratio: 1, items: gridCells(2, 2) }) },
-  { id: "g33", name: "Grade 3 × 3", desc: "Nove fotos, estilo clássico", make: () => ({ bg: "#faf6f4", ratio: 1.25, items: gridCells(3, 3) }) },
-  { id: "g23", name: "Grade 2 × 3", desc: "Seis fotos na vertical", make: () => ({ bg: "#faf6f4", ratio: 1.3, items: gridCells(2, 3) }) },
-  { id: "pal", name: "Fotos + paleta", desc: "Grade com fileira de cores embaixo", make: () => ({ bg: "#fff", ratio: 1.2, items: [...gridCells(3, 2, { x: 0, y: 0, w: 100, h: 84 }), ...paletteRow(88, 5)] }) },
-  { id: "glam", name: "Conceito", desc: "Título, fotos e paleta", make: () => ({ bg: "#fbf3f4", ratio: 1.3, items: [
-    { id: uid("mb_"), type: "text", text: "CONCEITO", x: 6, y: 5, w: 60, h: 8, z: 99, color: "#20151a", size: 5.2, font: "slab", weight: 700, align: "left", spacing: 2 },
-    ...gridCells(3, 2, { x: 4, y: 16, w: 92, h: 66 }), ...paletteRow(86, 5)
-  ] }) }
-];
+const dE = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 
-/* ---------- criar / abrir ---------- */
-function newMoodboard(tplId) {
-  const t = BOARD_TEMPLATES.find((x) => x.id === tplId) || BOARD_TEMPLATES[0];
-  newNote({ kind: "moodboard", title: t.id === "blank" ? "" : "Moodboard", board: t.make(), text: "Moodboard" });
+/* ---------- imagens (cache) ---------- */
+const MB_IMG = new Map();
+function mbLoadImg(src) {
+  if (!src) return Promise.resolve(null);
+  if (MB_IMG.has(src)) return MB_IMG.get(src);
+  const p = new Promise((res) => { const i = new Image(); i.decoding = "async"; i.onload = () => res(i); i.onerror = () => res(null); i.src = src; });
+  MB_IMG.set(src, p); if (MB_IMG.size > 60) MB_IMG.delete(MB_IMG.keys().next().value);
+  return p;
 }
-function moodboardPicker() {
-  const m = modal(`<div class="m-head"><div class="m-ic">${ic("board")}</div><h2>Novo moodboard</h2><button class="ib" id="mbX" aria-label="Fechar">${ic("x")}</button></div>
-    <div class="m-body tpl-body"><div class="tpl-grid mb-grid">${BOARD_TEMPLATES.map((t, i) => `<div class="tpl mb-tpl" role="button" tabindex="0" data-mbt="${t.id}" style="--i:${i}">
-      <div class="tpl-prev mb-prev">${boardPreviewHTML(t.make())}</div>
-      <div class="tpl-meta"><span class="tpl-ic">${ic("board")}</span><div><b>${esc(t.name)}</b><span>${esc(t.desc)}</span></div></div></div>`).join("")}</div></div>`, { wide: true });
-  m.querySelector(".modal").classList.add("tpl-modal");
-  const pick = (id) => { m.close(); newMoodboard(id); };
-  m.addEventListener("click", (e) => { if (e.target.closest("#mbX")) return m.close(); const c = e.target.closest("[data-mbt]"); if (c) pick(c.dataset.mbt); });
-  m.addEventListener("keydown", (e) => { const c = e.target.closest?.("[data-mbt]"); if (c && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); pick(c.dataset.mbt); } });
+const MB_SMALL = new WeakMap();
+function sampleImg(img, u, v) {
+  let c = MB_SMALL.get(img);
+  if (!c) { const k = Math.min(1, 360 / Math.max(img.naturalWidth, img.naturalHeight)); c = document.createElement("canvas"); c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k)); c.getContext("2d", { willReadFrequently: true }).drawImage(img, 0, 0, c.width, c.height); MB_SMALL.set(img, c); }
+  const x = clamp(Math.round(u * (c.width - 1)), 1, Math.max(1, c.width - 2)), y = clamp(Math.round(v * (c.height - 1)), 1, Math.max(1, c.height - 2));
+  try { const d = c.getContext("2d", { willReadFrequently: true }).getImageData(x - 1, y - 1, 3, 3).data; const s = [0, 0, 0]; for (let i = 0; i < d.length; i += 4) { s[0] += d[i]; s[1] += d[i + 1]; s[2] += d[i + 2]; } return hexOf(s.map((v2) => v2 / 9)); } catch (e) { return null; }
 }
-function boardPreviewHTML(board) {
-  const its = [...(board.items || [])].sort((a, b) => (a.z || 0) - (b.z || 0));
-  return `<div class="mb-mini" style="background:${esc(board.bg || "#faf6f4")};aspect-ratio:${(1 / (board.ratio || 1.25)).toFixed(3)}">${its.map((it) => mbItemMini(it)).join("")}</div>`;
-}
-function mbItemMini(it) {
-  const base = `position:absolute;left:${it.x}%;top:${it.y}%;width:${it.w}%;`;
-  if (it.type === "image") return `<div style="${base}height:${it.h}%;border-radius:${(it.rad || 8) / 3}px;background:${it.src ? `center/cover url(${it.src})` : "var(--line)"}"></div>`;
-  if (it.type === "color") return `<div style="${base}aspect-ratio:1;border-radius:50%;background:${esc(it.color)}"></div>`;
-  if (it.type === "text") return `<div style="${base}height:${it.h}%;font-size:6px;color:${esc(it.color || "#000")};font-weight:${it.weight || 600};overflow:hidden">${esc(it.text || "")}</div>`;
-  return "";
-}
-
-/* ---------- render do editor ---------- */
-function renderBoard(n, opts) {
-  BRD = BRD && BRD.id === n.id ? BRD : { id: n.id, sel: null };
-  const pane = $("#pane");
-  const b = n.board || (n.board = blankBoard());
-  pane.innerHTML = `
-    <div class="ed-top mb-top">
-      <button class="ib mob-back" data-act="mobback" aria-label="Voltar">${ic("left")}</button>
-      <button class="ib" data-act="expand" title="Expandir" aria-label="Expandir">${ic(S.expanded ? "uncollapse" : "collapse")}</button>
-      <div class="crumb"><button data-crumb="nb" title="Mover para outro caderno">${ic("book")}<span>${esc(nbName(n.nb))}</span></button>${ic("chev-r", "sep")}<span class="cur">${esc(titleOf(n))}</span></div>
-      <span class="status-pill" id="edStatus">${ic("check")}Salvo</span>
-      <button class="ib star${n.fav ? " on" : ""}" data-act="fav" title="Favoritar" aria-label="Favoritar">${ic("star")}</button>
-      <button class="btn sm mb-export" data-mb="export" title="Exportar como imagem">${ic("download")}<span>Exportar</span></button>
-      <button class="ib" data-act="notemenu" title="Mais opções" aria-label="Mais opções">${ic("more")}</button>
-    </div>
-    ${n.trashed ? `<div class="trash-banner">${ic("trash")}<span>Este moodboard está na lixeira.</span><button class="btn" data-act="restore">${ic("restore")}Restaurar</button><button class="btn danger" data-act="purge">Excluir para sempre</button></div>` : `
-    <div class="mb-tools" id="mbTools">
-      <input class="mb-title" id="mbTitle" placeholder="Título do moodboard" value="${esc(n.title || "")}" spellcheck="false">
-      <div class="mb-tbar">
-        <button class="mb-tb" data-mb="addimg">${ic("image")}<span>Foto</span></button>
-        <button class="mb-tb" data-mb="addtext">${ic("type")}<span>Texto</span></button>
-        <button class="mb-tb" data-mb="addcolor">${ic("swatch")}<span>Cor</span></button>
-        <button class="mb-tb" data-mb="palette">${ic("palette")}<span>Paleta das fotos</span></button>
-        <button class="mb-tb" data-mb="bg"><span class="mb-bgdot" style="background:${esc(b.bg)}"></span><span>Fundo</span></button>
-      </div>
-    </div>`}
-    <div class="mb-stage" id="mbStage"><div class="mb-canvas" id="mbCanvas" style="background:${esc(b.bg)};aspect-ratio:${(1 / (b.ratio || 1.25)).toFixed(3)}"></div></div>
-    <input type="file" id="mbFile" accept="image/*" hidden>`;
-  renderBoardItems();
-  if (!n.trashed) wireBoard(n);
-  const t = $("#mbTitle"); if (t) { t.oninput = () => { n.title = t.value; n.updated = Date.now(); markNote(n.id); renderList(false, true); renderTabs(); }; if (opts && opts.focusTitle) setTimeout(() => t.focus(), 60); }
-}
-function renderBoardItems() {
-  const n = S.notes.get(BRD.id); if (!n) return;
-  const cv = $("#mbCanvas"); if (!cv) return;
-  const its = [...(n.board.items || [])].sort((a, b) => (a.z || 0) - (b.z || 0));
-  cv.innerHTML = its.map((it) => mbItemHTML(it)).join("");
-  if (BRD.sel) { const el = cv.querySelector(`[data-it="${BRD.sel}"]`); if (el) selectItem(BRD.sel, true); }
-}
-function mbItemHTML(it) {
-  const pos = `left:${it.x}%;top:${it.y}%;width:${it.w}%;height:${it.h}%;z-index:${it.z || 0}`;
-  const sel = it.id === BRD.sel ? " sel" : "";
-  if (it.type === "image") return `<div class="mb-item mb-image${sel}${it.src ? "" : " empty"}" data-it="${it.id}" style="${pos};border-radius:${it.rad || 10}px">${it.src ? `<img src="${it.src}" style="border-radius:${it.rad || 10}px" draggable="false">` : `<span class="mb-add">${ic("plus")}<b>Foto</b></span>`}${handlesHTML()}</div>`;
-  if (it.type === "color") return `<div class="mb-item mb-color${sel}" data-it="${it.id}" style="left:${it.x}%;top:${it.y}%;width:${it.w}%;z-index:${it.z || 0};background:${esc(it.color)};border-radius:${it.rad != null ? it.rad : 50}%">${handlesHTML()}</div>`;
-  if (it.type === "text") return `<div class="mb-item mb-text${sel}" data-it="${it.id}" style="${pos};color:${esc(it.color || "#20151a")};font:${it.weight || 600} ${it.size || 4}cqw/1.15 ${boardFontCss(it.font)};text-align:${it.align || "left"};letter-spacing:${(it.spacing || 0)}px"><span class="mb-tcontent">${esc(it.text || "Texto")}</span>${handlesHTML()}</div>`;
-  return "";
-}
-const handlesHTML = () => `<span class="mb-h br" data-h="br"></span>`;
-
-/* ---------- interação (arrastar / redimensionar / selecionar) ---------- */
-function mbPaneClick(e) { const b = e.target.closest("[data-mb]"); if (b) { e.preventDefault(); mbToolbarClick(b.dataset.mb); } }
-function wireBoard(n) {
-  const pane = $("#pane");
-  pane.removeEventListener("click", mbPaneClick); pane.addEventListener("click", mbPaneClick);
-  const file = $("#mbFile");
-  if (file) file.addEventListener("change", (e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (f) mbFilePicked(f); });
-  const cv = $("#mbCanvas");
-  cv.addEventListener("pointerdown", (e) => {
-    const h = e.target.closest(".mb-h");
-    const itEl = e.target.closest(".mb-item");
-    if (!itEl) { selectItem(null); return; }
-    const id = itEl.dataset.it;
-    const wasSel = BRD.sel === id;
-    selectItem(id);
-    const it = n.board.items.find((x) => x.id === id); if (!it) return;
-    const rect = cv.getBoundingClientRect();
-    e.preventDefault(); itEl.setPointerCapture?.(e.pointerId);
-    const isColor = it.type === "color";
-    const start = { px: e.clientX, py: e.clientY, x: it.x, y: it.y, w: it.w, h: it.h, mode: h ? "resize" : "move" };
-    let moved = false;
-    const onMove = (ev) => {
-      const dx = (ev.clientX - start.px) / rect.width * 100, dy = (ev.clientY - start.py) / rect.height * 100;
-      if (Math.abs(ev.clientX - start.px) + Math.abs(ev.clientY - start.py) > 3) moved = true;
-      if (start.mode === "move") { it.x = clamp(start.x + dx, -5, 100 - 2); it.y = clamp(start.y + dy, -5, 100 - 2); }
-      else if (isColor) { it.w = clamp(start.w + dx, 4, 100); }
-      else { it.w = clamp(start.w + dx, 6, 110); it.h = clamp(start.h + dy, 6, 110); }
-      itEl.style.left = it.x + "%"; itEl.style.top = it.y + "%"; itEl.style.width = it.w + "%";
-      if (!isColor) itEl.style.height = it.h + "%";
-    };
-    const onUp = () => {
-      document.removeEventListener("pointermove", onMove); document.removeEventListener("pointerup", onUp);
-      if (moved) boardChanged(n, true);
-      else if (it.type === "image" && !it.src) { BRD.pendingFill = id; $("#mbFile").click(); }
-      else if (it.type === "text" && wasSel) editBoardText(it);
-    };
-    document.addEventListener("pointermove", onMove); document.addEventListener("pointerup", onUp);
-  });
-}
-function selectItem(id, silent) {
-  BRD.sel = id;
-  $$("#mbCanvas .mb-item").forEach((el) => el.classList.toggle("sel", el.dataset.it === id));
-  if (!silent) renderItemBar();
-}
-function renderItemBar() {
-  $("#mbItemBar")?.remove();
-  const n = S.notes.get(BRD.id); if (!BRD.sel) return;
-  const it = n.board.items.find((x) => x.id === BRD.sel); if (!it) return;
-  const bar = document.createElement("div"); bar.id = "mbItemBar"; bar.className = "mb-itembar";
-  const btn = (k, icn, lbl) => `<button class="mb-ib" data-mi="${k}" title="${lbl}" aria-label="${lbl}">${ic(icn)}</button>`;
-  let extra = "";
-  if (it.type === "image" && it.src) extra = btn("replace", "image", "Trocar foto");
-  if (it.type === "color") extra = `<button class="mb-ib" data-mi="recolor" title="Mudar cor"><span class="mb-bgdot" style="background:${esc(it.color)}"></span></button>`;
-  if (it.type === "text") extra = btn("edittext", "type", "Editar texto");
-  bar.innerHTML = extra + btn("front", "up", "Trazer pra frente") + btn("back", "down", "Mandar pra trás") + btn("dup", "dup", "Duplicar") + `<button class="mb-ib danger" data-mi="del" title="Excluir">${ic("trash")}</button>`;
-  $("#mbStage").appendChild(bar);
-  bar.addEventListener("click", (e) => { const b = e.target.closest("[data-mi]"); if (b) itemAction(b.dataset.mi, it); });
-}
-function itemAction(k, it) {
-  const n = S.notes.get(BRD.id);
-  if (k === "del") { n.board.items = n.board.items.filter((x) => x.id !== it.id); BRD.sel = null; $("#mbItemBar")?.remove(); boardChanged(n); return; }
-  if (k === "front") { it.z = Math.max(0, ...n.board.items.map((x) => x.z || 0)) + 1; boardChanged(n); return; }
-  if (k === "back") { it.z = Math.min(0, ...n.board.items.map((x) => x.z || 0)) - 1; boardChanged(n); return; }
-  if (k === "dup") { const c = { ...it, id: uid("mb_"), x: it.x + 3, y: it.y + 3, z: (it.z || 0) + 1 }; n.board.items.push(c); BRD.sel = c.id; boardChanged(n); return; }
-  if (k === "replace") { BRD.pendingFill = it.id; $("#mbFile").click(); return; }
-  if (k === "recolor") { pickColor(it.color, (col) => { it.color = col; boardChanged(n); }); return; }
-  if (k === "edittext") { editBoardText(it); return; }
-}
-function boardChanged(n, light) {
-  n.updated = Date.now();
-  n.text = "Moodboard" + (n.board.items.filter((i) => i.type === "text").map((i) => " · " + i.text).join(""));
-  markNote(n.id);
-  renderBoardItems(); renderItemBar();
-  if (!light) { renderList(false, true); }
-}
-
-/* ---------- adicionar itens ---------- */
 function boardImageFile(file) {
   return new Promise((res, rej) => {
     if (!file || !/^image\//.test(file.type)) return rej(new Error("tipo"));
@@ -3871,11 +3779,11 @@ function boardImageFile(file) {
     fr.onload = () => {
       const img = new Image();
       img.onload = () => {
-        const max = 1200, k = Math.min(1, max / Math.max(img.width, img.height));
+        const k = Math.min(1, 1400 / Math.max(img.width, img.height));
         const w = Math.max(1, Math.round(img.width * k)), h = Math.max(1, Math.round(img.height * k));
         const c = document.createElement("canvas"); c.width = w; c.height = h;
-        c.getContext("2d").drawImage(img, 0, 0, w, h);
-        let src; try { src = c.toDataURL("image/jpeg", .82); } catch (e) { src = fr.result; }
+        const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, w, h); x.drawImage(img, 0, 0, w, h);
+        let src; try { src = c.toDataURL("image/jpeg", 0.85); } catch (e) { src = fr.result; }
         res({ src, ratio: img.width / img.height });
       };
       img.onerror = rej; img.src = fr.result;
@@ -3883,170 +3791,1056 @@ function boardImageFile(file) {
     fr.onerror = rej; fr.readAsDataURL(file);
   });
 }
-function mbAddImage() { BRD.pendingFill = null; $("#mbFile").click(); }
-async function mbFilePicked(file) {
-  const n = S.notes.get(BRD.id); if (!n || !file) return;
-  try {
-    const { src, ratio } = await boardImageFile(file);
-    if (BRD.pendingFill) { const it = n.board.items.find((x) => x.id === BRD.pendingFill); BRD.pendingFill = null; if (it) { it.src = src; boardChanged(n); return; } }
-    const w = 46, h = clamp(w / ((ratio || 1) * boardAspect()), 14, 82);
-    n.board.items.push({ id: uid("mb_"), type: "image", src, x: 27, y: 22, w, h, z: topZ(n) + 1, rad: 10 });
-    boardChanged(n);
-  } catch (e) { toast("Não consegui carregar essa imagem."); }
+
+/* ---------- modelo de dados ---------- */
+function mbMigrate(b) {
+  if (!b || !Array.isArray(b.items)) return blankBoard();
+  if (b.v >= 2) return b;
+  b.items.forEach((it) => {
+    if (it.type === "image" && it.rad != null) it.rad = r3(it.rad / 6.8);
+    if (it.type === "text") { if (it.spacing && it.ls == null) it.ls = r3(it.spacing / 40); delete it.spacing; }
+    if (it.type === "color") { delete it.rad; delete it.h; }
+  });
+  b.v = 2; return b;
+}
+const itemH = (b, it) => (it.type === "color" ? it.w / (b.ratio || 1.25) : it.h || 6);
+const itemBox = (b, it) => ({ x: it.x, y: it.y, w: it.w, h: itemH(b, it) });
+const topZ = (b) => b.items.reduce((m, x) => Math.max(m, x.z || 0), 0);
+const palItems = (b) => b.items.filter((i) => i.type === "color" && i.pal);
+function snap(b) { return { ...b, grid: b.grid ? { ...b.grid, area: { ...b.grid.area }, spans: b.grid.spans ? b.grid.spans.map((x) => [...x]) : undefined } : undefined, items: b.items.map((it) => ({ ...it })) }; }
+function cloneBoardFresh(b) { const c = snap(mbMigrate(b)); c.items.forEach((it) => { it.id = uid("mb_"); delete it.locked; }); return c; }
+
+/* grade: board.grid = { cols, rows, area:{x,y,w,h} (% da folha), gap (% da largura), rad, spans? } */
+function gridRects(b) {
+  const g = b.grid; if (!g) return [];
+  const R = b.ratio || 1.25, A = g.area, gx = g.gap, gy = g.gap / R;
+  const cw = (A.w - gx * (g.cols + 1)) / g.cols, ch = (A.h - gy * (g.rows + 1)) / g.rows;
+  const spans = g.spans || Array.from({ length: g.cols * g.rows }, (_, i) => [i % g.cols, Math.floor(i / g.cols), 1, 1]);
+  return spans.map(([c, r, sw, sh]) => ({ x: A.x + gx + c * (cw + gx), y: A.y + gy + r * (ch + gy), w: cw * sw + gx * (sw - 1), h: ch * sh + gy * (sh - 1) }));
+}
+function layoutGrid(b) { const rs = gridRects(b); b.items.forEach((it) => { const r = it.cell != null && rs[it.cell]; if (r) { it.x = r3(r.x); it.y = r3(r.y); it.w = r3(r.w); it.h = r3(r.h); } }); }
+function growBoard(b, newR) {
+  const R = b.ratio || 1.25; if (newR <= R + 1e-4) return;
+  const f = R / newR;
+  b.items.forEach((it) => { it.y = r3(it.y * f); if (it.type !== "color") it.h = r3((it.h || 0) * f); });
+  if (b.grid) { b.grid.area.y *= f; b.grid.area.h *= f; }
+  b.ratio = r3(newR); layoutGrid(b);
+}
+/* faixa da paleta: sempre dentro da folha, centralizada, embaixo do conteúdo (cresce a folha se faltar espaço) */
+function layoutPalette(b, o = {}) {
+  const pal = palItems(b).sort((a, c) => (a.pi || 0) - (c.pi || 0)); if (!pal.length) return;
+  pal.forEach((p, i) => (p.pi = i));
+  const n = pal.length, d = Math.min(PAL.dmax, (100 - PAL.gap * (n + 1)) / n), total = n * d + (n - 1) * PAL.gap, x0 = (100 - total) / 2;
+  const stripW = d + (b.hex ? PAL.label : 0), need = stripW + PAL.margin * 2;
+  const others = b.items.filter((i) => !(i.type === "color" && i.pal));
+  const bottom = () => others.reduce((m, i) => { const bb = itemBox(b, i); return Math.max(m, (bb.y + bb.h) * (b.ratio || 1.25)); }, 0);
+  let R = b.ratio || 1.25, bw = bottom(), avail = R * 100 - bw;
+  if (avail < need - 0.01) {
+    if (o.noGrow && b.grid) { const A = b.grid.area; A.h = Math.max(25, (R * 100 - need) / R - A.y); layoutGrid(b); bw = bottom(); avail = R * 100 - bw; }
+    else if (!o.noGrow) { growBoard(b, (bw + need) / 100); R = b.ratio; avail = R * 100 - bw; }
+  }
+  let topW = avail <= need * 2.2 ? bw + (avail - stripW) / 2 : bw + PAL.margin * 1.6;
+  if (avail < need - 0.01) topW = Math.max(0, R * 100 - stripW - PAL.margin);
+  pal.forEach((p, i) => { p.x = r3(x0 + i * (d + PAL.gap)); p.y = r3(topW / R); p.w = r3(d); delete p.h; });
+}
+function mkGrid(o) {
+  const b = { v: 2, bg: o.bg || "#faf6f4", ratio: o.ratio || 1.25, items: [], hex: !!o.hex };
+  b.grid = { cols: o.cols, rows: o.rows, area: o.area || { x: 0, y: 0, w: 100, h: 100 }, gap: o.gap == null ? 2.4 : o.gap, rad: o.rad == null ? 1.4 : o.rad };
+  if (o.spans) b.grid.spans = o.spans;
+  const cells = o.spans ? o.spans.length : o.cols * o.rows;
+  for (let i = 0; i < cells; i++) b.items.push({ id: uid("mb_"), type: "image", src: "", cell: i, x: 0, y: 0, w: 10, h: 10, z: i + 1, rad: b.grid.rad });
+  (o.extra || []).forEach((it) => b.items.push({ id: uid("mb_"), ...it }));
+  layoutGrid(b);
+  if (o.pal) { o.pal.forEach((c, i) => b.items.push({ id: uid("mb_"), type: "color", color: c, pal: true, pi: i, x: 0, y: 0, w: 10, z: 60 + i })); layoutPalette(b, { noGrow: true }); }
+  return b;
+}
+const BOARD_TEMPLATES = [
+  { id: "blank", name: "Em branco", desc: "Comece do zero e monte livre", make: () => blankBoard() },
+  { id: "g22", name: "Grade 2 × 2", desc: "Quatro fotos em quadrado", make: () => mkGrid({ ratio: 1, cols: 2, rows: 2 }) },
+  { id: "g33", name: "Grade 3 × 3", desc: "Nove fotos, estilo clássico", make: () => mkGrid({ ratio: 1.25, cols: 3, rows: 3 }) },
+  { id: "hero", name: "Destaque", desc: "Uma foto grande e duas menores", make: () => mkGrid({ ratio: 1, cols: 3, rows: 2, spans: [[0, 0, 2, 2], [2, 0, 1, 1], [2, 1, 1, 1]] }) },
+  { id: "mosaic", name: "Mosaico", desc: "Tamanhos variados, cara de revista", make: () => mkGrid({ ratio: 1.25, cols: 3, rows: 3, spans: [[0, 0, 2, 1], [2, 0, 1, 2], [0, 1, 1, 2], [1, 1, 1, 1], [1, 2, 2, 1]] }) },
+  { id: "pal", name: "Fotos + paleta", desc: "Grade com as cores embaixo", make: () => mkGrid({ bg: "#ffffff", ratio: 1.1, cols: 3, rows: 2, area: { x: 0, y: 0, w: 100, h: 82 }, pal: PAL_DEF, hex: true }) },
+  { id: "glam", name: "Conceito", desc: "Título, fotos e paleta", make: () => mkGrid({ bg: "#fbf3f4", ratio: 1.3, cols: 3, rows: 2, area: { x: 2, y: 12, w: 96, h: 68 }, pal: PAL_DEF, extra: [{ type: "text", text: "CONCEITO", x: 6, y: 4, w: 70, h: 6, z: 90, color: "#20151a", size: 5.6, font: "slab", weight: 700, align: "left", ls: 0.12 }] }) },
+  { id: "story", name: "Story", desc: "Vertical 9:16 para o Instagram", make: () => mkGrid({ bg: "#f6efe9", ratio: 1.7778, cols: 2, rows: 3, area: { x: 2, y: 10, w: 96, h: 76 }, pal: PAL_DEF.slice(0, 4), extra: [{ type: "text", text: "Inspiração", x: 8, y: 2.6, w: 84, h: 5, z: 90, color: "#3a2a2a", size: 9.6, font: "script", weight: 700, align: "center", ls: 0 }] }) }
+];
+const boardText = (n) => "Moodboard" + ((n.board && n.board.items) || []).filter((i) => i.type === "text" && i.text).map((i) => " · " + i.text).join("");
+
+/* ---------- criar ---------- */
+function newMoodboard(tplId) {
+  const custom = (S.prefs.boardTpls || []).find((t) => t.id === tplId);
+  if (custom) { newNote({ kind: "moodboard", title: custom.name, board: cloneBoardFresh(custom.board), text: "Moodboard" }); return; }
+  const t = BOARD_TEMPLATES.find((x) => x.id === tplId) || BOARD_TEMPLATES[0];
+  newNote({ kind: "moodboard", title: t.id === "blank" ? "" : "Moodboard", board: t.make(), text: "Moodboard" });
+}
+function moodboardPicker() {
+  const mine = S.prefs.boardTpls || [];
+  const card = (id, name, desc, board, i, del) => `<div class="tpl mb-tpl" role="button" tabindex="0" data-mbt="${esc(id)}" style="--i:${i}">
+      <div class="tpl-prev mb-prev">${boardPreviewHTML(board)}</div>
+      <div class="tpl-meta"><span class="tpl-ic">${ic(del ? "template" : "board")}</span><div><b>${esc(name)}</b><span>${esc(desc)}</span></div></div>
+      ${del ? `<button class="mb-tdel" data-mbdel="${esc(id)}" title="Apagar modelo" aria-label="Apagar modelo">${ic("x")}</button>` : ""}</div>`;
+  const m = modal(`<div class="m-head"><div class="m-ic">${ic("board")}</div><h2>Novo moodboard</h2><button class="ib" id="mbX" aria-label="Fechar">${ic("x")}</button></div>
+    <div class="m-body tpl-body">
+      ${mine.length ? `<div class="mb-tsec">Meus modelos</div><div class="tpl-grid mb-grid">${mine.map((t, i) => card(t.id, t.name, "Seu modelo salvo", t.board, i, true)).join("")}</div><div class="mb-tsec">Prontos</div>` : ""}
+      <div class="tpl-grid mb-grid">${BOARD_TEMPLATES.map((t, i) => card(t.id, t.name, t.desc, t.make(), i + mine.length, false)).join("")}</div></div>`, { wide: true });
+  m.querySelector(".modal").classList.add("tpl-modal");
+  const pick = (id) => { m.close(); newMoodboard(id); };
+  m.addEventListener("click", async (e) => {
+    if (e.target.closest("#mbX")) return m.close();
+    const d = e.target.closest("[data-mbdel]");
+    if (d) {
+      e.stopPropagation();
+      const t = mine.find((x) => x.id === d.dataset.mbdel); if (!t) return;
+      m.close();
+      if (await ask({ title: "Apagar modelo?", text: `O modelo “${esc(t.name)}” sai da lista. Os moodboards já criados com ele não mudam.`, ok: "Apagar", danger: true, icon: "trash" })) {
+        S.prefs.boardTpls = (S.prefs.boardTpls || []).filter((x) => x.id !== t.id); savePrefs(); sysPush(); toast("Modelo apagado");
+      }
+      return moodboardPicker();
+    }
+    const c = e.target.closest("[data-mbt]"); if (c) pick(c.dataset.mbt);
+  });
+  m.addEventListener("keydown", (e) => { const c = e.target.closest?.("[data-mbt]"); if (c && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); pick(c.dataset.mbt); } });
+}
+function boardPreviewHTML(board) {
+  const b = mbMigrate(board), R = b.ratio || 1.25;
+  const its = [...b.items].sort((a, c) => (a.z || 0) - (c.z || 0));
+  return `<div class="mb-mini" style="background:${esc(b.bg || "#faf6f4")};aspect-ratio:${(1 / R).toFixed(3)}">${its.map((it) => {
+    const base = `left:${it.x}%;top:${it.y}%;width:${it.w}%;`;
+    if (it.type === "image") return `<i style="${base}height:${it.h}%;border-radius:${(it.rad || 0) * 0.6}px;${it.src ? `background:center/cover url(${it.src})` : ""}"${it.src ? "" : ' class="e"'}></i>`;
+    if (it.type === "color") return `<i class="c" style="${base}background:${esc(it.color)}"></i>`;
+    if (it.type === "text") return `<i class="t" style="${base}color:${esc(it.color || "#000")};font-family:${boardFontCss(it.font).replace(/"/g, "'")};text-align:${it.align || "left"};font-size:${it.size || 5}cqw;font-weight:${it.weight || 600};letter-spacing:${it.ls || 0}em">${esc(it.caps ? (it.text || "").toUpperCase() : it.text || "")}</i>`;
+    return "";
+  }).join("")}</div>`;
+}
+
+/* ---------- acesso ao estado ---------- */
+const mbNote = () => (BRD ? S.notes.get(BRD.id) : null);
+const mbBoard = () => { const n = mbNote(); return n ? n.board : null; };
+const mbItem = (id) => { const b = mbBoard(); return b && id ? b.items.find((x) => x.id === id) || null : null; };
+const mbActive = () => !!(BRD && S.active === BRD.id && $("#mbCanvas"));
+const mbEl = (id) => (id ? $(`#mbCanvas > [data-it="${id}"]`) : null);
+function boardBusy(id) { return !!(BRD && BRD.id === id && mbActive() && (BRD.drag || BRD.editing || BRD.crop || BRD.pinch || dirty.has(id))); }
+function hist() { let h = HIST.get(BRD.id); if (!h) { h = { s: [snap(mbBoard())], i: 0 }; HIST.set(BRD.id, h); } return h; }
+
+/* ---------- render do editor ---------- */
+function renderBoard(n, opts = {}) {
+  if (!BRD || BRD.id !== n.id) { if (BRD && BRD.ro) BRD.ro.disconnect(); BRD = { id: n.id, sel: null, view: 1, base: 0, ptrs: new Map() }; }
+  else { if (BRD.ro) BRD.ro.disconnect(); Object.assign(BRD, { editing: null, crop: null, pick: null, drag: null, pinch: null, swap: null, ptrs: new Map() }); }
+  n.board = mbMigrate(n.board);
+  const b = n.board, ro = n.trashed;
+  $("#pane").innerHTML = `
+    <div class="ed-top mb-top">
+      <button class="ib mob-back" data-act="mobback" aria-label="Voltar">${ic("left")}</button>
+      <button class="ib" data-act="expand" id="btnExpand" title="${S.expanded ? "Mostrar cadernos e lista" : "Expandir"} (Ctrl+Shift+E)" aria-label="Expandir">${ic(S.expanded ? "uncollapse" : "collapse")}</button>
+      <div class="crumb"><button data-crumb="nb" title="Mover para outro caderno">${ic("book")}<span>${esc(nbName(n.nb))}</span></button>${ic("chev-r", "sep")}<span class="cur" id="crumbTitle">${esc(titleOf(n))}</span></div>
+      <span class="status-pill" id="edStatus">${ic("check")}Salvo</span>
+      ${ro ? "" : `<button class="ib star${n.fav ? " on" : ""}" data-act="fav" title="Favoritar" aria-label="Favoritar">${ic("star")}</button>
+      <button class="ib" data-act="mbexport" title="Baixar como imagem" aria-label="Baixar como imagem">${ic("download")}</button>
+      ${shareBtnsHTML(n)}`}
+      <button class="ib" data-act="notemenu" title="Mais opções" aria-label="Mais opções">${ic("more")}</button>
+    </div>
+    ${ro ? `<div class="trash-banner">${ic("trash")}<span>Este moodboard está na lixeira.</span><button class="btn" data-act="restore">${ic("restore")}Restaurar</button><button class="btn danger" data-act="purge">Excluir para sempre</button></div>` : `
+    <div class="mb-tools" id="mbTools">
+      <input class="mb-title" id="mbTitle" placeholder="Título do moodboard" value="${esc(n.title || "")}" spellcheck="false" autocomplete="off">
+      <div class="mb-tbar">
+        <button class="mb-tb" data-mb="addimg" title="Adicionar fotos (ou arraste para a folha)">${ic("image")}<span>Foto</span></button>
+        <button class="mb-tb" data-mb="addtext" title="Adicionar texto">${ic("type")}<span>Texto</span></button>
+        <button class="mb-tb" data-mb="addcolor" title="Adicionar uma cor na paleta">${ic("swatch")}<span>Cor</span></button>
+        <button class="mb-tb" data-mb="palette" title="Paleta automática das fotos">${ic("palette")}<span>Paleta</span></button>
+        <button class="mb-tb" data-mb="sheet" title="Formato, fundo, espaçamento e cantos">${ic("sliders")}<span>Folha</span></button>
+        <span class="mb-tsp"></span>
+        <span class="mb-hist"><button class="mb-tb ic" data-mb="undo" id="mbUndo" title="Desfazer (Ctrl+Z)" aria-label="Desfazer">${ic("undo")}</button>
+        <button class="mb-tb ic" data-mb="redo" id="mbRedo" title="Refazer (Ctrl+Y)" aria-label="Refazer">${ic("redo")}</button></span>
+      </div>
+    </div>`}
+    <div class="mb-area${ro ? " ro" : ""}" id="mbArea">
+      <div class="mb-stage" id="mbStage"><div class="mb-wrap" id="mbWrap">
+        <div class="mb-canvas" id="mbCanvas"></div>
+        <div class="mb-over" id="mbOver"><img class="mb-ghost" id="mbGhost" alt="" hidden><div class="mb-guides" id="mbGuides"></div>
+          <div class="mb-sel" id="mbSel" hidden>${["nw", "n", "ne", "e", "se", "s", "sw", "w"].map((h) => `<i class="mb-hd" data-hd="${h}"></i>`).join("")}<span class="mb-lockb">${ic("lock")}</span></div></div>
+        <div class="mb-empty" id="mbEmpty">${ic("board")}<b>Seu moodboard começa aqui</b><span>Use Foto, Texto e Cor lá em cima${WEB && mqMobile.matches ? "" : " — ou arraste fotos do computador para cá"}.</span></div>
+      </div></div>
+      <div class="mb-ctx" id="mbCtx" role="toolbar" aria-label="Opções do item"></div>
+      <div class="mb-zoom" id="mbZoom"><button data-mz="out" title="Diminuir zoom" aria-label="Diminuir zoom">${ic("minus")}</button><button data-mz="fit" id="mbZoomL" title="Ajustar à tela">100%</button><button data-mz="in" title="Aumentar zoom" aria-label="Aumentar zoom">${ic("plus")}</button></div>
+      <div class="mb-pickbar" id="mbPick" hidden>${ic("pipette")}<span>Toque na foto, bem no ponto da cor que você quer</span><button class="btn sm" data-mz="pickcancel">Cancelar</button></div>
+      <div class="mb-dropzone" id="mbDrop"><div>${ic("image")}<b>Solte as fotos aqui</b><span>Em cima de um quadro, a foto entra nele</span></div></div>
+    </div>
+    <input type="file" id="mbFile" accept="image/*" multiple hidden>`;
+  hist();
+  wireBoard(ro);
+  mbFit(true);
+  syncBoard({ intro: true });
+  updUndoBtns(); showCtx();
+  const t = $("#mbTitle");
+  if (t) {
+    t.addEventListener("input", () => { const nn = mbNote(); if (!nn) return; nn.title = t.value; nn.updated = Date.now(); markNote(nn.id); const c = $("#crumbTitle"); if (c) c.textContent = titleOf(nn); renderTabs(); renderListSoon(); });
+    t.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); t.blur(); } });
+    if (opts.focusTitle) setTimeout(() => t.focus(), 80);
+  }
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { if (mbActive()) { measureTexts(mbBoard()); placeSel(); } });
+}
+
+/* sincroniza o DOM com os dados (sem recriar o que já existe: nada pisca) */
+function syncBoard(o = {}) {
+  const b = mbBoard(), cv = $("#mbCanvas"); if (!b || !cv) return;
+  cv.style.aspectRatio = String(1 / (b.ratio || 1.25)); cv.style.background = b.bg || "#faf6f4";
+  cv.classList.toggle("hexon", !!b.hex);
+  const wrap = $("#mbWrap") || cv;
+  wrap.style.setProperty("--hexc", hexLabelColor(b.bg || "#fff"));
+  wrap.style.setProperty("--emptyc", lum(b.bg || "#fff") > 0.55 ? "rgba(40,30,35,.5)" : "rgba(255,255,255,.62)");
+  if (o.anim) { cv.classList.add("anim"); clearTimeout(BRD.animT); BRD.animT = setTimeout(() => cv.classList.remove("anim"), 420); }
+  const seen = new Set(); let born = 0;
+  b.items.forEach((it) => {
+    seen.add(it.id);
+    let el = mbEl(it.id);
+    if (!el || el.dataset.t !== it.type) {
+      if (el) el.remove();
+      el = document.createElement("div"); el.dataset.it = it.id; el.dataset.t = it.type; el.className = "mb-item mb-" + it.type;
+      if (!o.quiet) { el.classList.add(o.intro ? "intro" : "born"); el.style.animationDelay = Math.min(born++, 14) * (o.intro ? 22 : 45) + "ms"; setTimeout(() => { el.classList.remove("intro", "born"); el.style.animationDelay = ""; }, 900); }
+      cv.appendChild(el);
+    }
+    paintItem(el, it, b);
+  });
+  [...cv.children].forEach((el) => { if (el.dataset.it && !seen.has(el.dataset.it)) { el.removeAttribute("data-it"); el.classList.add("gone"); setTimeout(() => el.remove(), 220); } });
+  measureTexts(b);
+  placeSel(); placeGhost();
+  const em = $("#mbEmpty"); if (em) em.classList.toggle("show", !b.items.length);
+}
+function cropBox(it, b) {
+  const R = b.ratio || 1.25, fa = it.w / (Math.max(0.01, it.h) * R), ia = it.ia || fa, z = it.zoom || 1;
+  let wr, hr; if (ia > fa) { hr = z; wr = (z * ia) / fa; } else { wr = z; hr = (z * fa) / ia; }
+  const fx = it.fx == null ? 50 : it.fx, fy = it.fy == null ? 50 : it.fy;
+  return { w: wr * 100, h: hr * 100, l: -(wr - 1) * fx, t: -(hr - 1) * fy };
+}
+function paintCrop(img, it, b) { const c = cropBox(it, b), s = img.style; s.left = c.l + "%"; s.top = c.t + "%"; s.width = c.w + "%"; s.height = c.h + "%"; }
+function paintPos(el, it) { if (!el) return; const s = el.style; s.left = it.x + "%"; s.top = it.y + "%"; s.width = it.w + "%"; if (it.type === "image") s.height = it.h + "%"; }
+function paintItem(el, it, b) {
+  const s = el.style;
+  paintPos(el, it); s.zIndex = String(it.z || 0);
+  el.classList.toggle("locked", !!it.locked);
+  if (it.type === "image") {
+    s.borderRadius = (it.rad || 0) + "cqw";
+    el.classList.toggle("empty", !it.src);
+    let img = el.querySelector("img");
+    if (it.src) {
+      if (!img) { el.innerHTML = ""; img = document.createElement("img"); img.alt = ""; img.draggable = false; img.decoding = "async"; el.appendChild(img); }
+      if (img._src !== it.src) {
+        img._src = it.src; img.src = it.src;
+        img.onload = () => { const cur = mbItem(el.dataset.it); const ia = img.naturalWidth / img.naturalHeight; if (cur && ia && Math.abs((cur.ia || 0) - ia) > 0.002) { cur.ia = r3(ia); paintCrop(img, cur, mbBoard()); placeGhost(); } };
+      }
+      paintCrop(img, it, b);
+    } else if (!el.querySelector(".mb-add")) el.innerHTML = `<span class="mb-add">${ic("image")}<b>Foto</b></span>`;
+  } else if (it.type === "color") {
+    s.height = ""; s.background = it.color || "#ccc";
+    let hx = el.querySelector(".mb-hex"); if (!hx) { hx = document.createElement("span"); hx.className = "mb-hex"; el.appendChild(hx); }
+    hx.textContent = (it.color || "").toUpperCase();
+  } else if (it.type === "text") {
+    s.height = "";
+    let tc = el.querySelector(".mb-tc"); if (!tc) { tc = document.createElement("div"); tc.className = "mb-tc"; el.appendChild(tc); }
+    if (BRD.editing !== it.id && tc.textContent !== (it.text || "")) tc.textContent = it.text || "";
+    s.color = it.color || "#20151a"; s.fontFamily = boardFontCss(it.font); s.fontSize = (it.size || 5) + "cqw";
+    s.fontWeight = String(it.weight || 600); s.fontStyle = it.italic ? "italic" : "normal"; s.textTransform = it.caps ? "uppercase" : "none";
+    s.letterSpacing = (it.ls || 0) + "em"; s.textAlign = it.align || "left";
+  }
+}
+function measureTexts(b) {
+  const cv = $("#mbCanvas"); if (!cv || !b) return; const H = cv.clientHeight; if (!H) return;
+  b.items.forEach((it) => { if (it.type !== "text") return; const el = mbEl(it.id); if (el) it.h = r3((el.offsetHeight / H) * 100); });
+}
+function placeSel() {
+  const box = $("#mbSel"); if (!box || !BRD) return;
+  const b = mbBoard(), it = BRD.sel && mbItem(BRD.sel);
+  if (!it || BRD.pick) { box.hidden = true; return; }
+  const r = itemBox(b, it); box.hidden = false;
+  box.style.left = r.x + "%"; box.style.top = r.y + "%"; box.style.width = r.w + "%"; box.style.height = r.h + "%";
+  box.className = "mb-sel t-" + it.type + (it.locked ? " locked" : "") + (BRD.crop === it.id ? " cropping" : "") + (BRD.editing === it.id ? " editing" : "") + (BRD.drag ? " moving" : "") + (it.type === "color" ? " round" : "");
+}
+function placeGhost() {
+  const gh = $("#mbGhost"); if (!gh || !BRD) return;
+  const it = BRD.crop && mbItem(BRD.crop); if (!it) { gh.hidden = true; return; }
+  const b = mbBoard(), r = itemBox(b, it), c = cropBox(it, b);
+  gh.style.left = r.x + (c.l / 100) * r.w + "%"; gh.style.top = r.y + (c.t / 100) * r.h + "%"; gh.style.width = (c.w / 100) * r.w + "%"; gh.style.height = (c.h / 100) * r.h + "%";
+}
+function updUndoBtns() { if (!BRD) return; const h = HIST.get(BRD.id); const u = $("#mbUndo"), r = $("#mbRedo"); if (u) u.disabled = !h || h.i <= 0; if (r) r.disabled = !h || h.i >= h.s.length - 1; }
+
+/* ---------- gravar e desfazer ---------- */
+function mbSave(n) { n.updated = Date.now(); n.text = boardText(n); markNote(n.id); renderListSoon(); }
+let mbSoftT = 0;
+function mbSaveSoft() { const id = BRD && BRD.id; clearTimeout(mbSoftT); mbSoftT = setTimeout(() => { const n = S.notes.get(id); if (n) mbSave(n); }, 400); }
+function mbCommit(o = {}) {
+  const n = mbNote(); if (!n) return;
+  clearTimeout(mbSoftT);
+  syncBoard(o);
+  const h = hist(); h.s = h.s.slice(0, h.i + 1); h.s.push(snap(n.board)); if (h.s.length > 150) h.s.shift(); h.i = h.s.length - 1;
+  mbSave(n); updUndoBtns();
+  if (!BRD.drag) showCtx();
+}
+function mbRestore(sn) {
+  const n = mbNote(); if (!n) return;
+  n.board = snap(sn);
+  if (!n.board.items.some((x) => x.id === BRD.sel)) BRD.sel = null;
+  mbFit(); syncBoard({ anim: true, quiet: true }); mbSave(n); updUndoBtns(); showCtx();
+}
+function mbUndo() { if (!mbActive()) return; if (BRD.editing) endTextEdit(); if (BRD.crop) endCrop(); const h = hist(); if (h.i <= 0) return; h.i--; mbRestore(h.s[h.i]); }
+function mbRedo() { if (!mbActive()) return; if (BRD.editing) endTextEdit(); if (BRD.crop) endCrop(); const h = hist(); if (h.i >= h.s.length - 1) return; h.i++; mbRestore(h.s[h.i]); }
+
+/* ---------- seleção e barra contextual ---------- */
+function mbSelect(id) {
+  if (BRD.crop && BRD.crop !== id) endCrop();
+  if (BRD.editing && BRD.editing !== id) endTextEdit();
+  if (BRD.sel === id) { placeSel(); showCtx(); return; }
+  BRD.sel = id; placeSel(); showCtx();
+}
+function hideCtx() { const bar = $("#mbCtx"); if (bar) bar.classList.remove("show"); }
+function showCtx() {
+  const bar = $("#mbCtx"); if (!bar || !BRD) return;
+  const it = BRD.sel && mbItem(BRD.sel), n = mbNote();
+  if (!it || !n || n.trashed || BRD.drag || BRD.pick) { hideCtx(); return; }
+  bar.innerHTML = ctxHTML(mbBoard(), it); bar.dataset.t = it.type;
+  requestAnimationFrame(() => bar.classList.add("show"));
+}
+const sizeLabel = (s) => Math.round((s || 5) * 10);
+function ctxHTML(b, it) {
+  const B = (k, icon, title, cls = "") => `<button class="mb-cb ${cls}" data-mc="${k}" title="${title}" aria-label="${title}">${ic(icon)}</button>`;
+  const sep = '<span class="mb-csep"></span>';
+  if (BRD.crop === it.id) return `<span class="mb-chint">${ic("crop")}Arraste a foto para enquadrar</span>${sep}<span class="mb-czoom">${ic("minus")}<input type="range" class="mb-range" data-mr="zoom" min="1" max="5" step="0.01" value="${it.zoom || 1}" aria-label="Zoom da foto">${ic("plus")}</span>${B("recenter", "target", "Centralizar de novo")}<button class="btn primary sm mb-cdone" data-mc="cropdone">${ic("check")}Concluir</button>`;
+  const common = (it.locked ? "" : B("front", "up", "Trazer para a frente (Ctrl+])") + B("back", "down", "Mandar para trás (Ctrl+[)") + B("dup", "dup", "Duplicar (Ctrl+D)")) + B("lock", it.locked ? "lock" : "unlock", it.locked ? "Destravar" : "Travar no lugar", it.locked ? "on" : "") + (it.locked ? "" : B("del", "trash", "Excluir (Delete)", "danger"));
+  if (it.locked) return `<span class="mb-chint">${ic("lock")}Travado</span>${sep}${common}`;
+  if (it.type === "image") return (it.src ? B("crop", "crop", "Enquadrar a foto (duplo clique)") + B("replace", "image", "Trocar a foto") + B("eyedrop", "pipette", "Pegar uma cor desta foto para a paleta") : `<button class="mb-ctext" data-mc="replace">${ic("image")}Escolher foto</button>`) + sep + common;
+  if (it.type === "color") return `<button class="mb-cb mb-cdot" data-mc="recolor" title="Mudar a cor" aria-label="Mudar a cor"><span style="background:${esc(it.color)}"></span></button><button class="mb-ctext mono" data-mc="copyhex" title="Copiar o código da cor">${esc((it.color || "").toUpperCase())}${ic("copy")}</button>` + sep + common;
+  const f = MB_FONTS.find((x) => x[0] === (it.font || "")) || MB_FONTS[0];
+  return B("edit", "edit", "Editar o texto (Enter)") + `<button class="mb-ctext mb-cfont" data-mc="font" style="font-family:${f[2].replace(/"/g, "'")}" title="Fonte">${f[1]}${ic("chev-d")}</button>`
+    + `<span class="mb-cstep">${B("smaller", "minus", "Diminuir a letra")}<b title="Tamanho">${sizeLabel(it.size)}</b>${B("bigger", "plus", "Aumentar a letra")}</span>`
+    + B("bold", "bold", "Negrito", (it.weight || 600) >= 700 ? "on" : "") + B("italic", "italic", "Itálico", it.italic ? "on" : "") + B("caps", "caps", "Tudo maiúsculo", it.caps ? "on" : "")
+    + B("align", { left: "al", center: "ac", right: "ar" }[it.align || "left"], "Alinhamento") + B("spacing", "width", "Espaço entre as letras")
+    + `<button class="mb-cb mb-cdot" data-mc="tcolor" title="Cor do texto" aria-label="Cor do texto"><span style="background:${esc(it.color || "#20151a")}"></span></button>` + sep + common;
+}
+function stepSize(it, dir) { const cur = it.size || 5; let i = MB_SIZES.findIndex((s) => s >= cur - 0.01); if (i < 0) i = MB_SIZES.length - 1; if (dir > 0) i = MB_SIZES[i] > cur + 0.01 ? i : i + 1; else i = MB_SIZES[i] < cur - 0.01 ? i : i - 1; it.size = MB_SIZES[clamp(i, 0, MB_SIZES.length - 1)]; }
+function mbCtxClick(e) {
+  const btn = e.target.closest("[data-mc]"); if (!btn) return;
+  const it = mbItem(BRD.sel); if (!it) return;
+  const b = mbBoard();
+  switch (btn.dataset.mc) {
+    case "front": it.z = topZ(b) + 1; mbCommit(); break;
+    case "back": it.z = b.items.reduce((m, x) => Math.min(m, x.z || 0), 0) - 1; mbCommit(); break;
+    case "dup": mbDuplicate(); break;
+    case "lock": if (it.locked) delete it.locked; else it.locked = true; mbCommit(); toast(it.locked ? "Travado: não sai do lugar sem querer" : "Destravado"); break;
+    case "del": mbDelete(); break;
+    case "crop": startCrop(it.id); break;
+    case "replace": mbPickFile(it.id); break;
+    case "eyedrop": mbEyedrop((c) => mbAddPalColor(c), it.id); break;
+    case "recolor": colorPop(btn, it.color, (c) => { it.color = c; mbCommit(); }); break;
+    case "copyhex": copyText((it.color || "").toUpperCase(), `Código ${(it.color || "").toUpperCase()} copiado`); break;
+    case "edit": startTextEdit(it.id, true); break;
+    case "font": menu(btn, MB_FONTS.map(([v, l, css]) => ({ label: l, style: `font-family:${css.replace(/"/g, "'")};font-size:15px`, checked: (it.font || "") === v, run: () => { it.font = v; mbCommit(); } }))); break;
+    case "smaller": case "bigger": stepSize(it, btn.dataset.mc === "bigger" ? 1 : -1); mbCommit(); break;
+    case "bold": it.weight = (it.weight || 600) >= 700 ? 400 : 700; mbCommit(); break;
+    case "italic": it.italic = !it.italic; if (!it.italic) delete it.italic; mbCommit(); break;
+    case "caps": it.caps = !it.caps; if (!it.caps) delete it.caps; mbCommit(); break;
+    case "align": it.align = { left: "center", center: "right", right: "left" }[it.align || "left"]; mbCommit(); break;
+    case "spacing": spacingPop(btn, it); break;
+    case "tcolor": colorPop(btn, it.color || "#20151a", (c) => { it.color = c; mbCommit(); }); break;
+    case "recenter": it.fx = 50; it.fy = 50; it.zoom = 1; paintCropLive(it); { const r = $('#mbCtx [data-mr="zoom"]'); if (r) r.value = 1; } break;
+    case "cropdone": endCrop(); break;
+  }
+}
+function spacingPop(btn, it) {
+  const p = popover(btn, `<div class="mb-spop"><div class="mb-plabel">Espaço entre as letras <span id="lsV">${Math.round((it.ls || 0) * 100)}</span></div><input type="range" class="mb-range" id="lsR" min="-5" max="50" step="1" value="${Math.round((it.ls || 0) * 100)}"></div>`);
+  const r = $("#lsR", p);
+  r.addEventListener("input", () => { it.ls = +r.value / 100; $("#lsV", p).textContent = r.value; const el = mbEl(it.id); if (el) el.style.letterSpacing = it.ls + "em"; measureTexts(mbBoard()); placeSel(); });
+  r.addEventListener("change", () => mbCommit());
+}
+
+/* ---------- ações nos itens ---------- */
+function mbDelete() {
+  const b = mbBoard(), it = mbItem(BRD.sel); if (!it) return;
+  if (BRD.editing === it.id) BRD.editing = null;
+  b.items = b.items.filter((x) => x.id !== it.id);
+  if (it.pal) layoutPalette(b, { noGrow: true });
+  BRD.sel = null; hideCtx(); mbCommit({ anim: !!it.pal });
+  toast(it.type === "image" ? "Foto excluída" : it.type === "color" ? "Cor excluída" : "Texto excluído", { label: "Desfazer", run: mbUndo });
+}
+function mbDuplicate() {
+  const b = mbBoard(), it = mbItem(BRD.sel); if (!it) return;
+  const c = { ...it, id: uid("mb_"), x: r3(it.x + 3), y: r3(it.y + 3 / (b.ratio || 1.25)), z: topZ(b) + 1 };
+  delete c.cell; delete c.pal; delete c.pi; delete c.locked;
+  b.items.push(c); BRD.sel = c.id; mbCommit();
+}
+function mbPasteItem() {
+  if (!MBCLIP || !mbActive()) return;
+  const b = mbBoard(), c = { ...MBCLIP, id: uid("mb_"), z: topZ(b) + 1 };
+  delete c.cell; delete c.pal; delete c.pi; delete c.locked;
+  if (b.items.some((x) => Math.abs(x.x - c.x) < 0.5 && Math.abs(x.y - c.y) < 0.5)) { c.x = r3(c.x + 3); c.y = r3(c.y + 3 / (b.ratio || 1.25)); }
+  MBCLIP = { ...c };
+  b.items.push(c); BRD.sel = c.id; mbCommit();
 }
 function mbAddText() {
-  const n = S.notes.get(BRD.id);
-  const it = { id: uid("mb_"), type: "text", text: "Texto", x: 20, y: 44, w: 60, h: 12, z: topZ(n) + 1, color: "#20151a", size: 6, font: "slab", weight: 700, align: "center", spacing: 0 };
-  n.board.items.push(it); BRD.sel = it.id; boardChanged(n); editBoardText(it);
+  const b = mbBoard(), c = viewCenterPct();
+  const it = { id: uid("mb_"), type: "text", text: "Seu texto", x: r3(clamp(c.x - 30, 0, 40)), y: r3(clamp(c.y - 4, 1, 90)), w: 60, h: 8, z: topZ(b) + 1, color: lum(b.bg || "#fff") > 0.5 ? "#20151a" : "#ffffff", size: 6.4, font: "slab", weight: 700, align: "center", ls: 0 };
+  b.items.push(it); BRD.sel = it.id; mbCommit(); startTextEdit(it.id, true);
 }
-function mbAddColor() {
-  const n = S.notes.get(BRD.id);
-  pickColor("#e9c7c0", (col) => { const it = { id: uid("mb_"), type: "color", color: col, x: 42, y: 42, w: 15, z: topZ(n) + 1, rad: 50 }; n.board.items.push(it); BRD.sel = it.id; boardChanged(n); });
+function mbAddPalColor(c) {
+  const b = mbBoard(); if (!b) return;
+  const pal = palItems(b);
+  const it = { id: uid("mb_"), type: "color", color: c, pal: true, pi: pal.length ? Math.max(...pal.map((p) => p.pi || 0)) + 1 : 0, x: 0, y: 0, w: 10, z: topZ(b) + 1 };
+  b.items.push(it); layoutPalette(b); BRD.sel = it.id; mbFit(); mbCommit({ anim: true });
+  toast(`Cor ${c.toUpperCase()} adicionada à paleta`);
 }
-function boardAspect() { const n = S.notes.get(BRD.id); return (n && n.board.ratio) || 1.25; }
-function topZ(n) { return Math.max(0, ...n.board.items.map((x) => x.z || 0)); }
+function mbPickFile(target) { BRD.fill = target || null; const f = $("#mbFile"); if (f) f.click(); }
+function canvasPct(cx, cy) { const r = $("#mbCanvas").getBoundingClientRect(); return { x: ((cx - r.left) / r.width) * 100, y: ((cy - r.top) / r.height) * 100 }; }
+function viewCenterPct() { const st = $("#mbStage"); if (!st) return { x: 50, y: 50 }; const r = st.getBoundingClientRect(); const p = canvasPct(r.left + r.width / 2, r.top + r.height / 2); return { x: clamp(p.x, 18, 82), y: clamp(p.y, 14, 86) }; }
+async function mbAddFiles(files, o = {}) {
+  const n = mbNote(); if (!n || n.trashed) return;
+  const id0 = n.id;
+  files = [...files].filter((f) => /^image\//.test(f.type));
+  if (!files.length) { toast("Escolha arquivos de imagem (JPG, PNG, WEBP…)"); return; }
+  if (files.length > 2) toast(`Adicionando ${plural(files.length, "foto", "fotos")}…`);
+  const loaded = [];
+  for (const f of files) { try { loaded.push(await boardImageFile(f)); } catch (e) {} }
+  if (!BRD || BRD.id !== id0 || !mbActive()) return;
+  if (!loaded.length) { toast("Não consegui abrir essas imagens."); return; }
+  const b = n.board, R = b.ratio || 1.25, q = [...loaded];
+  const put = (it, d) => { it.src = d.src; it.ia = r3(d.ratio); delete it.fx; delete it.fy; delete it.zoom; };
+  let last = null;
+  const tgt = o.target && mbItem(o.target);
+  if (tgt && tgt.type === "image") { put(tgt, q.shift()); last = tgt.id; }
+  b.items.filter((i) => i.type === "image" && !i.src).sort((a, c) => (a.cell ?? 999) - (c.cell ?? 999) || a.y - c.y || a.x - c.x).forEach((it) => { if (q.length) { put(it, q.shift()); last = last || it.id; } });
+  const c = o.at || viewCenterPct();
+  q.forEach((d, i) => {
+    const w = q.length > 1 ? 34 : 46, h = clamp(w / ((d.ratio || 1) * R), 8, 92);
+    const it = { id: uid("mb_"), type: "image", src: d.src, ia: r3(d.ratio), x: r3(clamp(c.x - w / 2 + i * 4, -w / 2, 100 - w / 2)), y: r3(clamp(c.y - h / 2 + (i * 4) / R, -h / 2, 100 - h / 2)), w, h: r3(h), z: topZ(b) + 1, rad: b.grid ? b.grid.rad : 1.2 };
+    b.items.push(it); last = it.id;
+  });
+  BRD.sel = last; mbCommit();
+  if (loaded.length > 1) toast(`${plural(loaded.length, "foto adicionada", "fotos adicionadas")}`);
+}
+
+/* ---------- texto direto na folha ---------- */
+function startTextEdit(id, selectAll) {
+  const el = mbEl(id), it = mbItem(id); if (!el || !it || it.locked) return;
+  if (BRD.crop) endCrop();
+  BRD.sel = id; BRD.editing = id; BRD.editStart = it.text;
+  const tc = el.querySelector(".mb-tc"); el.classList.add("editing");
+  try { tc.contentEditable = "plaintext-only"; } catch (e) {}
+  if (tc.contentEditable !== "plaintext-only") tc.contentEditable = "true";
+  tc.spellcheck = true;
+  tc.focus();
+  const r = document.createRange(); r.selectNodeContents(tc); if (!selectAll) r.collapse(false);
+  const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+  tc.oninput = () => { const cur = mbItem(id); if (!cur) return; cur.text = tc.innerText.replace(/\n$/, ""); measureTexts(mbBoard()); placeSel(); mbSaveSoft(); };
+  tc.onblur = () => setTimeout(() => { if (BRD && BRD.editing === id && document.activeElement !== tc) endTextEdit(); }, 0);
+  tc.onkeydown = (e) => { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); endTextEdit(); } };
+  placeSel(); showCtx();
+}
+function endTextEdit() {
+  const id = BRD && BRD.editing; if (!id) return;
+  BRD.editing = null;
+  const el = mbEl(id), it = mbItem(id);
+  if (el) { const tc = el.querySelector(".mb-tc"); if (tc) { tc.contentEditable = "false"; tc.oninput = tc.onblur = tc.onkeydown = null; if (document.activeElement === tc) tc.blur(); } el.classList.remove("editing"); }
+  try { getSelection().removeAllRanges(); } catch (e) {}
+  if (!it) return;
+  if (!(it.text || "").trim()) { const b = mbBoard(); b.items = b.items.filter((x) => x.id !== id); BRD.sel = null; mbCommit(); return; }
+  if (it.text !== BRD.editStart) mbCommit(); else { placeSel(); showCtx(); }
+}
+
+/* ---------- enquadrar a foto dentro do quadro ---------- */
+function startCrop(id) {
+  const it = mbItem(id); if (!it || !it.src || it.locked) return;
+  if (BRD.editing) endTextEdit();
+  BRD.sel = id; BRD.crop = id; BRD.cropStart = JSON.stringify([it.fx, it.fy, it.zoom]);
+  mbEl(id)?.classList.add("cropping"); $("#mbArea")?.classList.add("cropmode");
+  const gh = $("#mbGhost"); if (gh) { gh.src = it.src; gh.hidden = false; }
+  placeGhost(); placeSel(); showCtx();
+}
+function endCrop() {
+  const id = BRD && BRD.crop; if (!id) return;
+  BRD.crop = null;
+  mbEl(id)?.classList.remove("cropping"); $("#mbArea")?.classList.remove("cropmode");
+  const gh = $("#mbGhost"); if (gh) { gh.hidden = true; gh.removeAttribute("src"); }
+  const it = mbItem(id);
+  if (it && JSON.stringify([it.fx, it.fy, it.zoom]) !== BRD.cropStart) mbCommit(); else { placeSel(); showCtx(); }
+}
+function paintCropLive(it) { const el = mbEl(it.id), img = el && el.querySelector("img"); if (img) paintCrop(img, it, mbBoard()); placeGhost(); mbSaveSoft(); }
+function startCropPan(e) {
+  e.preventDefault();
+  const it = mbItem(BRD.crop), el = mbEl(BRD.crop); if (!it || !el) return;
+  const r = el.getBoundingClientRect(), c0 = cropBox(it, mbBoard());
+  const ovx = (c0.w / 100 - 1) * r.width, ovy = (c0.h / 100 - 1) * r.height;
+  const s = { x0: e.clientX, y0: e.clientY, fx: it.fx == null ? 50 : it.fx, fy: it.fy == null ? 50 : it.fy, pid: e.pointerId };
+  el.classList.add("panning"); BRD.drag = s;
+  const move = (ev) => {
+    if (ev.pointerId !== s.pid || BRD.pinch) return;
+    it.fx = ovx > 0.5 ? r3(clamp(s.fx - ((ev.clientX - s.x0) / ovx) * 100, 0, 100)) : 50;
+    it.fy = ovy > 0.5 ? r3(clamp(s.fy - ((ev.clientY - s.y0) / ovy) * 100, 0, 100)) : 50;
+    paintCropLive(it);
+  };
+  const up = (ev) => { if (ev.pointerId !== s.pid) return; removeEventListener("pointermove", move); removeEventListener("pointerup", up); removeEventListener("pointercancel", up); el.classList.remove("panning"); BRD.drag = null; };
+  addEventListener("pointermove", move); addEventListener("pointerup", up); addEventListener("pointercancel", up);
+}
+
+/* ---------- guias inteligentes (ímã) ---------- */
+function snapTargets(b, selfId) {
+  const v = [0, 50, 100], h = [0, 50, 100], boxes = [];
+  b.items.forEach((it) => { if (it.id === selfId) return; const r = itemBox(b, it); boxes.push(r); v.push(r.x, r.x + r.w / 2, r.x + r.w); h.push(r.y, r.y + r.h / 2, r.y + r.h); });
+  return { v, h, boxes };
+}
+function near(val, arr, th) { let best = null, bd = th; for (const p of arr) { const d = Math.abs(p - val); if (d <= bd) { bd = d; best = p; } } return best; }
+function gapSnap(boxes, bx, ax, th) {
+  const [p, s, q, t] = ax === "x" ? ["x", "w", "y", "h"] : ["y", "h", "x", "w"];
+  const row = boxes.filter((r) => r[q] < bx[q] + bx[t] - 0.2 && r[q] + r[t] > bx[q] + 0.2).sort((a, c) => a[p] - c[p]);
+  const gaps = [];
+  for (let i = 0; i + 1 < row.length; i++) { const a = row[i], c = row[i + 1], g = c[p] - (a[p] + a[s]); if (g > 0.4) gaps.push({ a, c, g }); }
+  if (!gaps.length) return null;
+  let best = null;
+  for (const G of gaps) for (const r of row) {
+    const d1 = r[p] + r[s] + G.g - bx[p]; if (Math.abs(d1) <= th && (!best || Math.abs(d1) < Math.abs(best.d))) best = { d: d1, G, n: r, side: 1 };
+    const d2 = r[p] - G.g - bx[s] - bx[p]; if (Math.abs(d2) <= th && (!best || Math.abs(d2) < Math.abs(best.d))) best = { d: d2, G, n: r, side: -1 };
+  }
+  return best;
+}
+function gapMarks(ax, gs, bx) {
+  const [p, s, q, t] = ax === "x" ? ["x", "w", "y", "h"] : ["y", "h", "x", "w"];
+  const mid = (a, c) => (Math.max(a[q], c[q]) + Math.min(a[q] + a[t], c[q] + c[t])) / 2;
+  const mk = (a, c) => ({ o: ax === "x" ? "gx" : "gy", a: a[p] + a[s], b: c[p], m: mid(a, c) });
+  const out = [mk(gs.G.a, gs.G.c)];
+  out.push(gs.side > 0 ? mk(gs.n, bx) : mk(bx, gs.n));
+  return out;
+}
+function snapMove(T, bx, W, H) {
+  const tx = (7 / W) * 100, ty = (7 / H) * 100, g = [];
+  let dx = null, lx = null, dy = null, ly = null;
+  for (const o of [0, bx.w / 2, bx.w]) for (const p of T.v) { const d = p - (bx.x + o); if (Math.abs(d) <= tx && (dx === null || Math.abs(d) < Math.abs(dx))) { dx = d; lx = p; } }
+  for (const o of [0, bx.h / 2, bx.h]) for (const p of T.h) { const d = p - (bx.y + o); if (Math.abs(d) <= ty && (dy === null || Math.abs(d) < Math.abs(dy))) { dy = d; ly = p; } }
+  const gx = gapSnap(T.boxes, bx, "x", tx), gy = gapSnap(T.boxes, bx, "y", ty);
+  let useGx = false, useGy = false;
+  if (gx && (dx === null || Math.abs(gx.d) < Math.abs(dx) - 0.01)) { dx = gx.d; lx = null; useGx = true; }
+  if (gy && (dy === null || Math.abs(gy.d) < Math.abs(dy) - 0.01)) { dy = gy.d; ly = null; useGy = true; }
+  const out = { x: bx.x + (dx || 0), y: bx.y + (dy || 0), g };
+  const fb = { x: out.x, y: out.y, w: bx.w, h: bx.h };
+  if (lx !== null) g.push({ o: "v", p: lx });
+  if (ly !== null) g.push({ o: "h", p: ly });
+  if (useGx) g.push(...gapMarks("x", gx, fb));
+  if (useGy) g.push(...gapMarks("y", gy, fb));
+  return out;
+}
+function drawGuides(list) {
+  const gd = $("#mbGuides"); if (!gd) return;
+  gd.innerHTML = (list || []).map((x) => x.o === "v" ? `<i class="gv" style="left:${x.p}%"></i>` : x.o === "h" ? `<i class="gh" style="top:${x.p}%"></i>`
+    : x.o === "gx" ? `<i class="ggx" style="left:${x.a}%;width:${Math.max(0, x.b - x.a)}%;top:${x.m}%"></i>` : `<i class="ggy" style="top:${x.a}%;height:${Math.max(0, x.b - x.a)}%;left:${x.m}%"></i>`).join("");
+}
+
+/* ---------- ponteiro: arrastar, redimensionar, rolar, pinça ---------- */
+function wireBoard(ro) {
+  const area = $("#mbArea"), st = $("#mbStage");
+  area.addEventListener("pointerdown", mbDown);
+  st.addEventListener("wheel", mbWheel, { passive: false });
+  $("#mbZoom").addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("#mbZoom").addEventListener("click", (e) => { const z = e.target.closest("[data-mz]"); if (!z) return; const k = z.dataset.mz; if (k === "in") setView(BRD.view * 1.25); else if (k === "out") setView(BRD.view / 1.25); else if (k === "fit") { BRD.view = 1; applyView(); st.scrollTo({ left: 0, top: 0, behavior: "smooth" }); } });
+  BRD.ro = new ResizeObserver(() => { cancelAnimationFrame(BRD.roT); BRD.roT = requestAnimationFrame(() => mbFit()); });
+  BRD.ro.observe(st);
+  if (ro) return;
+  area.addEventListener("dblclick", mbDbl);
+  area.addEventListener("contextmenu", mbContext);
+  area.addEventListener("dragenter", mbDragOver); area.addEventListener("dragover", mbDragOver);
+  area.addEventListener("dragleave", mbDragLeave); area.addEventListener("drop", mbDrop);
+  const ctx = $("#mbCtx");
+  ctx.addEventListener("pointerdown", (e) => { e.stopPropagation(); if (!e.target.closest("input")) e.preventDefault(); });
+  ctx.addEventListener("click", mbCtxClick);
+  ctx.addEventListener("input", (e) => { const r = e.target.closest('[data-mr="zoom"]'); const it = r && mbItem(BRD.crop); if (it) { it.zoom = r3(+r.value); paintCropLive(it); } });
+  $("#mbPick").addEventListener("pointerdown", (e) => e.stopPropagation());
+  $("#mbPick").addEventListener("click", (e) => { if (e.target.closest('[data-mz="pickcancel"]')) mbPickEnd(); });
+  $("#mbTools").addEventListener("click", (e) => { const b = e.target.closest("[data-mb]"); if (b) mbToolbar(b.dataset.mb, b); });
+  $("#mbFile").addEventListener("change", (e) => { const fs = [...(e.target.files || [])]; e.target.value = ""; const t = BRD.fill; BRD.fill = null; if (fs.length) mbAddFiles(fs, { target: t }); });
+}
+function mbToolbar(k, btn) {
+  if (BRD.editing) endTextEdit();
+  if (BRD.crop) endCrop();
+  if (k === "addimg") mbPickFile(null);
+  else if (k === "addtext") mbAddText();
+  else if (k === "addcolor") colorPop(btn, "#e9c7c0", (c) => mbAddPalColor(c), { title: "Adicionar cor" });
+  else if (k === "palette") palettePop(btn);
+  else if (k === "sheet") sheetPop(btn);
+  else if (k === "undo") mbUndo();
+  else if (k === "redo") mbRedo();
+}
+function mbDown(e) {
+  if (e.target.closest(".mb-ctx,.mb-zoom,.mb-pickbar")) return;
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  const n = mbNote(); if (!n) return;
+  closePop();
+  BRD.ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (e.pointerType === "touch" && BRD.ptrs.size === 2) { startPinch(); return; }
+  if (BRD.ptrs.size > 1) return;
+  if (n.trashed) { if (e.pointerType !== "mouse" && e.target.closest("#mbCanvas")) startPan(e); return; }
+  const ae = document.activeElement;
+  if (ae && ae !== document.body && !BRD.editing && !(ae.closest && ae.closest(".mb-canvas"))) ae.blur();
+  if (BRD.pick) { e.preventDefault(); mbSampleAt(e.clientX, e.clientY); return; }
+  const hd = e.target.closest(".mb-hd");
+  if (hd && BRD.sel) { startResize(e, hd.dataset.hd); return; }
+  const itEl = e.target.closest("#mbCanvas > .mb-item"), id = itEl && itEl.dataset.it;
+  if (BRD.editing) { if (id === BRD.editing) return; endTextEdit(); }
+  if (BRD.crop) { if (id === BRD.crop) { startCropPan(e); return; } endCrop(); }
+  if (!id) { mbSelect(null); if (e.pointerType !== "mouse" && e.target.closest("#mbCanvas,#mbWrap")) startPan(e); return; }
+  const it = mbItem(id); if (!it) return;
+  const wasSel = BRD.sel === id;
+  if (e.pointerType !== "mouse" && (!wasSel || it.locked)) {
+    // no toque: o 1º toque só seleciona; arrastar sem selecionar rola a folha
+    startPan(e, () => { if (!wasSel) { mbSelect(id); if (it.type === "image" && !it.src) mbPickFile(id); } });
+    return;
+  }
+  mbSelect(id);
+  if (it.locked) return;
+  startMove(e, it, wasSel);
+}
+function startMove(e, it, wasSel) {
+  e.preventDefault();
+  const b = mbBoard(), cv = $("#mbCanvas"), el = mbEl(it.id), rc = cv.getBoundingClientRect(), box0 = itemBox(b, it);
+  const s = { x0: e.clientX, y0: e.clientY, ix: it.x, iy: it.y, moved: false, W: rc.width, H: rc.height, pid: e.pointerId };
+  const T = snapTargets(b, it.id);
+  BRD.drag = s;
+  const area = $("#mbArea");
+  const move = (ev) => {
+    if (ev.pointerId !== s.pid) return;
+    if (BRD.pinch) { if (!s.cancel) { s.cancel = true; it.x = s.ix; it.y = s.iy; paintPos(el, it); drawGuides([]); setSwap(null); } return; }
+    const dx = ev.clientX - s.x0, dy = ev.clientY - s.y0;
+    if (!s.moved) { if (Math.hypot(dx, dy) < (ev.pointerType === "mouse" ? 3 : 7)) return; s.moved = true; el.classList.add("dragging"); area.classList.add("dragging"); hideCtx(); }
+    let nx = s.ix + (dx / s.W) * 100, ny = s.iy + (dy / s.H) * 100, g = [];
+    if (!ev.altKey) { const sn = snapMove(T, { x: nx, y: ny, w: box0.w, h: box0.h }, s.W, s.H); nx = sn.x; ny = sn.y; g = sn.g; }
+    it.x = r3(nx); it.y = r3(ny); paintPos(el, it); placeSel();
+    const sw = it.type === "image" && !ev.altKey ? findSwap(ev.clientX, ev.clientY, it.id) : null;
+    setSwap(sw); drawGuides(sw ? [] : g);
+  };
+  const up = (ev) => {
+    if (ev.pointerId !== s.pid) return;
+    removeEventListener("pointermove", move); removeEventListener("pointerup", up); removeEventListener("pointercancel", up);
+    BRD.drag = null; el.classList.remove("dragging"); area.classList.remove("dragging"); drawGuides([]);
+    const tgt = BRD.swap; setSwap(null);
+    if (s.cancel) { placeSel(); showCtx(); return; }
+    if (!s.moved) { if (ev.type === "pointerup") mbItemClick(it, wasSel); placeSel(); if (!BRD.editing) showCtx(); return; }
+    if (tgt && ev.type === "pointerup") { swapImages(it, tgt, s.ix, s.iy); return; }
+    if (Math.abs(it.x - s.ix) < 0.05 && Math.abs(it.y - s.iy) < 0.05) { it.x = s.ix; it.y = s.iy; paintPos(el, it); placeSel(); showCtx(); return; }
+    if (it.cell != null) delete it.cell;
+    if (it.pal) { delete it.pal; delete it.pi; layoutPalette(mbBoard(), { noGrow: true }); mbCommit({ anim: true }); return; }
+    mbCommit();
+  };
+  addEventListener("pointermove", move); addEventListener("pointerup", up); addEventListener("pointercancel", up);
+}
+function mbItemClick(it, wasSel) {
+  if (it.type === "image" && !it.src) { mbPickFile(it.id); return; }
+  if (it.type === "text" && wasSel && !it.locked) startTextEdit(it.id, false);
+}
+function mbDbl(e) {
+  const el = e.target.closest("#mbCanvas > .mb-item"); if (!el) return;
+  const it = mbItem(el.dataset.it); if (!it || it.locked || BRD.editing === it.id) return;
+  if (it.type === "text") startTextEdit(it.id, true);
+  else if (it.type === "image" && it.src) startCrop(it.id);
+  else if (it.type === "color") { const b = $('#mbCtx [data-mc="recolor"]'); colorPop(b || el, it.color, (c) => { it.color = c; mbCommit(); }); }
+}
+function mbContext(e) {
+  const el = e.target.closest("#mbCanvas > .mb-item"); if (!el) return;
+  e.preventDefault();
+  const id = el.dataset.it; mbSelect(id);
+  const it = mbItem(id); if (!it) return;
+  const act = (k) => () => mbCtxClick({ target: { closest: () => ({ dataset: { mc: k } }) } });
+  const items = [];
+  if (it.type === "image" && it.src && !it.locked) items.push({ icon: "crop", label: "Enquadrar", run: () => startCrop(id) }, { icon: "image", label: "Trocar foto…", run: () => mbPickFile(id) }, { icon: "pipette", label: "Pegar cor desta foto", run: act("eyedrop") }, "-");
+  if (it.type === "image" && !it.src) items.push({ icon: "image", label: "Escolher foto…", run: () => mbPickFile(id) }, "-");
+  if (it.type === "text" && !it.locked) items.push({ icon: "edit", label: "Editar texto", run: () => startTextEdit(id, true) }, "-");
+  if (it.type === "color") items.push({ icon: "copy", label: `Copiar ${(it.color || "").toUpperCase()}`, run: act("copyhex") }, "-");
+  if (!it.locked) items.push({ icon: "up", label: "Trazer para a frente", k: "Ctrl+]", run: act("front") }, { icon: "down", label: "Mandar para trás", k: "Ctrl+[", run: act("back") }, { icon: "dup", label: "Duplicar", k: "Ctrl+D", run: mbDuplicate }, { icon: "copy", label: "Copiar", k: "Ctrl+C", run: () => { MBCLIP = { ...it }; toast("Copiado — cole com Ctrl+V"); } });
+  items.push({ icon: it.locked ? "unlock" : "lock", label: it.locked ? "Destravar" : "Travar no lugar", run: act("lock") });
+  if (!it.locked) items.push("-", { icon: "trash", label: "Excluir", k: "Delete", danger: true, run: mbDelete });
+  ctxMenu(e, items);
+}
+function findSwap(cx, cy, self) {
+  for (const el of document.elementsFromPoint(cx, cy)) {
+    if (!el.matches || !el.matches("#mbCanvas > .mb-image") || el.dataset.it === self) continue;
+    const r = el.getBoundingClientRect(), ix = r.width * 0.2, iy = r.height * 0.2;
+    return cx > r.left + ix && cx < r.right - ix && cy > r.top + iy && cy < r.bottom - iy ? el.dataset.it : null;
+  }
+  return null;
+}
+function setSwap(id) {
+  if (BRD.swap === id) return;
+  mbEl(BRD.swap)?.classList.remove("swap");
+  BRD.swap = id || null;
+  mbEl(BRD.swap)?.classList.add("swap");
+}
+function swapImages(a, tid, ix, iy) {
+  const t = mbItem(tid); if (!t) return;
+  const K = ["src", "ia", "fx", "fy", "zoom"], va = K.map((k) => a[k]), vt = K.map((k) => t[k]);
+  K.forEach((k, i) => { if (vt[i] == null) delete a[k]; else a[k] = vt[i]; if (va[i] == null) delete t[k]; else t[k] = va[i]; });
+  a.x = ix; a.y = iy;
+  BRD.sel = t.id;
+  mbCommit({ anim: true });
+  [mbEl(a.id), mbEl(t.id)].forEach((x) => x && x.animate([{ filter: "brightness(1.25)" }, { filter: "none" }], { duration: 420, easing: "ease-out" }));
+}
+function startResize(e, hd) {
+  e.preventDefault(); e.stopPropagation();
+  const it = mbItem(BRD.sel); if (!it || it.locked) return;
+  const b = mbBoard(), cv = $("#mbCanvas"), rc = cv.getBoundingClientRect(), el = mbEl(it.id), R = b.ratio || 1.25;
+  const W = rc.width, H = rc.height, T = snapTargets(b, it.id), b0 = itemBox(b, it);
+  const L0 = b0.x, T0 = b0.y, R0 = b0.x + b0.w, B0 = b0.y + b0.h;
+  const hasW = hd.includes("w"), hasE = hd.includes("e"), hasN = hd.includes("n"), hasS = hd.includes("s"), corner = hd.length === 2;
+  const s = { x0: e.clientX, y0: e.clientY, size: it.size || 5, pid: e.pointerId, moved: false };
+  const area = $("#mbArea");
+  BRD.drag = s; hideCtx(); area.classList.add("dragging"); placeSel();
+  const move = (ev) => {
+    if (ev.pointerId !== s.pid || BRD.pinch) return;
+    s.moved = true;
+    const dx = ((ev.clientX - s.x0) / W) * 100, dy = ((ev.clientY - s.y0) / H) * 100, g = [];
+    let L = L0 + (hasW ? dx : 0), Rr = R0 + (hasE ? dx : 0), Tt = T0 + (hasN ? dy : 0), Bb = B0 + (hasS ? dy : 0);
+    if (!ev.altKey) {
+      const tx = (7 / W) * 100, ty = (7 / H) * 100;
+      if (hasW) { const p = near(L, T.v, tx); if (p != null) { L = p; g.push({ o: "v", p }); } }
+      if (hasE) { const p = near(Rr, T.v, tx); if (p != null) { Rr = p; g.push({ o: "v", p }); } }
+      if (it.type === "image") {
+        if (hasN) { const p = near(Tt, T.h, ty); if (p != null) { Tt = p; g.push({ o: "h", p }); } }
+        if (hasS) { const p = near(Bb, T.h, ty); if (p != null) { Bb = p; g.push({ o: "h", p }); } }
+      }
+    }
+    const keep = it.type === "color" || (it.type === "text" && corner) || (it.type === "image" && corner && ev.shiftKey);
+    if (keep) {
+      const kx = (Rr - L) / Math.max(0.01, R0 - L0), ky = hasN || hasS ? (Bb - Tt) / Math.max(0.01, B0 - T0) : kx;
+      let k = it.type === "text" ? kx : Math.abs(kx - 1) >= Math.abs(ky - 1) ? kx : ky;
+      k = Math.max(k, 0.05);
+      const nw = (R0 - L0) * k, nh = (B0 - T0) * k;
+      if (hasW) L = R0 - nw; else Rr = L0 + nw;
+      if (hasN) Tt = B0 - nh; else Bb = T0 + nh;
+    }
+    if (it.type === "image") {
+      it.x = r3(Math.min(L, Rr - 3)); it.y = r3(Math.min(Tt, Bb - 2)); it.w = r3(Math.max(3, Rr - L)); it.h = r3(Math.max(2, Bb - Tt));
+      paintPos(el, it); const img = el.querySelector("img"); if (img) paintCrop(img, it, b);
+    } else if (it.type === "color") {
+      const d = Math.max(2, Rr - L); it.w = r3(d); it.x = r3(hasW ? R0 - d : L0); it.y = r3(hasN ? B0 - d / R : T0); paintPos(el, it);
+    } else {
+      const nw = Math.max(4, Rr - L);
+      if (corner) { it.size = r3(clamp(s.size * (nw / Math.max(0.01, R0 - L0)), 0.8, 40)); el.style.fontSize = it.size + "cqw"; }
+      it.w = r3(nw); it.x = r3(hasW ? R0 - nw : L0); paintPos(el, it);
+      measureTexts(b); if (hasN) { it.y = r3(B0 - it.h); paintPos(el, it); }
+    }
+    placeSel(); drawGuides(g);
+  };
+  const up = (ev) => {
+    if (ev.pointerId !== s.pid) return;
+    removeEventListener("pointermove", move); removeEventListener("pointerup", up); removeEventListener("pointercancel", up);
+    BRD.drag = null; area.classList.remove("dragging"); drawGuides([]);
+    if (!s.moved) { placeSel(); showCtx(); return; }
+    if (it.cell != null) delete it.cell;
+    if (it.pal) { delete it.pal; delete it.pi; layoutPalette(b, { noGrow: true }); }
+    mbCommit();
+  };
+  addEventListener("pointermove", move); addEventListener("pointerup", up); addEventListener("pointercancel", up);
+}
+function startPan(e, onTap) {
+  e.preventDefault();
+  const st = $("#mbStage"); if (!st) return;
+  const s = { x: e.clientX, y: e.clientY, l: st.scrollLeft, t: st.scrollTop, moved: false, pid: e.pointerId, hist: [] };
+  cancelAnimationFrame(BRD.inertia);
+  const move = (ev) => {
+    if (ev.pointerId !== s.pid) return;
+    if (BRD.pinch) { s.moved = true; return; }
+    const dx = ev.clientX - s.x, dy = ev.clientY - s.y;
+    if (!s.moved && Math.hypot(dx, dy) < 8) return;
+    s.moved = true; st.scrollLeft = s.l - dx; st.scrollTop = s.t - dy;
+    s.hist.push([performance.now(), ev.clientX, ev.clientY]); if (s.hist.length > 6) s.hist.shift();
+  };
+  const up = (ev) => {
+    if (ev.pointerId !== s.pid) return;
+    removeEventListener("pointermove", move); removeEventListener("pointerup", up); removeEventListener("pointercancel", up);
+    if (!s.moved) { if (onTap && ev.type === "pointerup") onTap(); return; }
+    const h = s.hist; if (h.length < 2 || BRD.pinch) return;
+    const [t0, x0, y0] = h[0], [t1, x1, y1] = h[h.length - 1], dt = Math.max(1, t1 - t0);
+    if (performance.now() - t1 > 80) return;
+    let vx = ((x1 - x0) / dt) * 16, vy = ((y1 - y0) / dt) * 16;
+    const step = () => { vx *= 0.94; vy *= 0.94; if (Math.abs(vx) < 0.4 && Math.abs(vy) < 0.4) return; st.scrollLeft -= vx; st.scrollTop -= vy; BRD.inertia = requestAnimationFrame(step); };
+    BRD.inertia = requestAnimationFrame(step);
+  };
+  addEventListener("pointermove", move); addEventListener("pointerup", up); addEventListener("pointercancel", up);
+}
+function startPinch() {
+  const [a, c] = [...BRD.ptrs.values()];
+  const it = BRD.crop && mbItem(BRD.crop);
+  BRD.pinch = { d0: Math.hypot(a.x - c.x, a.y - c.y) || 1, v0: BRD.view, z0: it ? it.zoom || 1 : 0 };
+  hideCtx();
+}
+function pinchMove() {
+  const ps = [...BRD.ptrs.values()]; if (ps.length < 2 || !BRD.pinch) return;
+  const k = Math.hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y) / BRD.pinch.d0;
+  const it = BRD.crop && mbItem(BRD.crop);
+  if (it) { it.zoom = r3(clamp(BRD.pinch.z0 * k, 1, 5)); paintCropLive(it); const r = $('#mbCtx [data-mr="zoom"]'); if (r) r.value = it.zoom; }
+  else setView(BRD.pinch.v0 * k, (ps[0].x + ps[1].x) / 2, (ps[0].y + ps[1].y) / 2);
+}
+addEventListener("pointermove", (e) => { if (!BRD || !BRD.ptrs || !BRD.ptrs.has(e.pointerId)) return; BRD.ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY }); if (BRD.pinch) pinchMove(); }, true);
+const mbPtrEnd = (e) => { if (!BRD || !BRD.ptrs || !BRD.ptrs.has(e.pointerId)) return; BRD.ptrs.delete(e.pointerId); if (BRD.ptrs.size < 2 && BRD.pinch) { BRD.pinch = null; if (mbActive()) showCtx(); } };
+addEventListener("pointerup", mbPtrEnd, true); addEventListener("pointercancel", mbPtrEnd, true);
+
+/* ---------- zoom da folha ---------- */
+function mbFit(force) {
+  const st = $("#mbStage"); if (!st || !BRD) return;
+  const b = mbBoard(); if (!b) return;
+  const R = b.ratio || 1.25, mob = mqMobile.matches;
+  const aw = st.clientWidth - (mob ? 28 : 80), ah = st.clientHeight - (mob ? 110 : 154);
+  if (aw <= 0) return;
+  const base = clamp(mob ? aw : Math.min(aw, Math.max(ah / R, 320)), 160, 1000);
+  if (!force && Math.abs(base - BRD.base) < 1) return;
+  BRD.base = base; applyView();
+}
+function applyView() {
+  const wrap = $("#mbWrap"); if (!wrap) return;
+  wrap.style.width = Math.round(BRD.base * BRD.view) + "px";
+  const zl = $("#mbZoomL"); if (zl) zl.textContent = Math.round(BRD.view * 100) + "%";
+  $("#mbArea")?.classList.toggle("zoomed", Math.abs(BRD.view - 1) > 0.01);
+  measureTexts(mbBoard()); placeSel(); placeGhost();
+}
+function setView(v, cx, cy) {
+  const st = $("#mbStage"), wrap = $("#mbWrap"); if (!st || !wrap) return;
+  v = clamp(v, 0.4, 4);
+  if (cx == null) { const sr = st.getBoundingClientRect(); cx = sr.left + sr.width / 2; cy = sr.top + sr.height / 2; }
+  const r0 = wrap.getBoundingClientRect(), fx = (cx - r0.left) / r0.width, fy = (cy - r0.top) / r0.height;
+  BRD.view = v; applyView();
+  const r1 = wrap.getBoundingClientRect();
+  st.scrollLeft += r1.left + fx * r1.width - cx; st.scrollTop += r1.top + fy * r1.height - cy;
+}
+function mbWheel(e) {
+  if (BRD.crop) {
+    const el = e.target.closest("#mbCanvas > .mb-item");
+    if (el && el.dataset.it === BRD.crop) { e.preventDefault(); const it = mbItem(BRD.crop); it.zoom = r3(clamp((it.zoom || 1) * Math.exp(-e.deltaY * 0.0015), 1, 5)); paintCropLive(it); const r = $('#mbCtx [data-mr="zoom"]'); if (r) r.value = it.zoom; return; }
+  }
+  if (e.ctrlKey || e.metaKey) { e.preventDefault(); e.stopPropagation(); setView(BRD.view * Math.exp(-e.deltaY * 0.0022), e.clientX, e.clientY); }
+}
+
+/* ---------- soltar arquivos e colar ---------- */
+const hasFiles = (e) => [...((e.dataTransfer && e.dataTransfer.types) || [])].includes("Files");
+function markDrop(id) { $$("#mbCanvas > .droptgt").forEach((x) => x.dataset.it !== id && x.classList.remove("droptgt")); if (id) mbEl(id)?.classList.add("droptgt"); }
+function dropTargetAt(cx, cy) { const el = document.elementsFromPoint(cx, cy).find((x) => x.matches && x.matches("#mbCanvas > .mb-image")); return el ? el.dataset.it : null; }
+function mbDragOver(e) { if (!hasFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = "copy"; $("#mbArea").classList.add("dropping"); markDrop(dropTargetAt(e.clientX, e.clientY)); }
+function mbDragLeave(e) { const a = $("#mbArea"); if (!a || (e.relatedTarget && a.contains(e.relatedTarget))) return; a.classList.remove("dropping"); markDrop(null); }
+function mbDrop(e) {
+  if (!hasFiles(e)) return;
+  e.preventDefault(); e.stopPropagation();
+  $("#mbArea").classList.remove("dropping");
+  const tid = dropTargetAt(e.clientX, e.clientY); markDrop(null);
+  const files = [...e.dataTransfer.files];
+  const tgt = tid && files.length === 1 ? tid : tid && !mbItem(tid)?.src ? tid : null;
+  mbAddFiles(files, { target: tgt, at: canvasPct(e.clientX, e.clientY) });
+}
+document.addEventListener("paste", (e) => {
+  if (!mbActive() || mbNote().trashed) return;
+  const t = e.target;
+  if (BRD.editing || (t && (t.isContentEditable || /^(INPUT|TEXTAREA)$/.test(t.tagName || "")))) return;
+  const files = [...((e.clipboardData && e.clipboardData.files) || [])].filter((f) => /^image\//.test(f.type));
+  if (files.length) { e.preventDefault(); e.stopImmediatePropagation(); const s = mbItem(BRD.sel); mbAddFiles(files, { target: s && s.type === "image" ? s.id : null }); return; }
+  if (MBCLIP) { e.preventDefault(); e.stopImmediatePropagation(); mbPasteItem(); }
+}, true);
+
+/* ---------- teclado ---------- */
+function nudge(key, big) {
+  const it = mbItem(BRD.sel); if (!it || it.locked) return;
+  const cv = $("#mbCanvas"), px = big ? 10 : 1;
+  const dx = key === "ArrowLeft" ? -px : key === "ArrowRight" ? px : 0, dy = key === "ArrowUp" ? -px : key === "ArrowDown" ? px : 0;
+  it.x = r3(it.x + (dx / cv.clientWidth) * 100); it.y = r3(it.y + (dy / cv.clientHeight) * 100);
+  paintPos(mbEl(it.id), it); placeSel();
+  clearTimeout(BRD.nudgeT);
+  BRD.nudgeT = setTimeout(() => { const cur = mbItem(it.id); if (!cur) return; if (cur.cell != null) delete cur.cell; if (cur.pal) { delete cur.pal; delete cur.pi; layoutPalette(mbBoard(), { noGrow: true }); } mbCommit(); }, 350);
+}
+document.addEventListener("keydown", (e) => {
+  if (!mbActive() || mbNote().trashed) return;
+  if ($(".scrim:not(.closing)") || popEl) return;
+  const t = e.target, mod = e.ctrlKey || e.metaKey, k = (e.key || "").toLowerCase();
+  if (BRD.editing) { if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); endTextEdit(); } return; }
+  if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ""))) return;
+  let done = true;
+  if (BRD.pick && e.key === "Escape") mbPickEnd();
+  else if (BRD.crop && (e.key === "Escape" || e.key === "Enter")) endCrop();
+  else if (mod && k === "z" && !e.shiftKey) mbUndo();
+  else if (mod && (k === "y" || (k === "z" && e.shiftKey))) mbRedo();
+  else if (!BRD.sel) done = false;
+  else if (e.key === "Delete" || e.key === "Backspace") { if (!mbItem(BRD.sel)?.locked) mbDelete(); }
+  else if (e.key === "Escape") mbSelect(null);
+  else if (mod && k === "d") mbDuplicate();
+  else if (mod && k === "c") { MBCLIP = { ...mbItem(BRD.sel) }; toast("Copiado — cole com Ctrl+V"); }
+  else if (mod && k === "x") { MBCLIP = { ...mbItem(BRD.sel) }; mbDelete(); }
+  else if (mod && e.key === "]") mbCtxClick({ target: { closest: () => ({ dataset: { mc: "front" } }) } });
+  else if (mod && e.key === "[") mbCtxClick({ target: { closest: () => ({ dataset: { mc: "back" } }) } });
+  else if (e.key === "Enter") { const it = mbItem(BRD.sel); if (it.type === "text") startTextEdit(it.id, true); else if (it.type === "image" && it.src) startCrop(it.id); else if (it.type === "image") mbPickFile(it.id); }
+  else if (/^Arrow/.test(e.key) && !mod) nudge(e.key, e.shiftKey);
+  else done = false;
+  if (done) { e.preventDefault(); e.stopImmediatePropagation(); }
+}, true);
+
+/* ---------- conta-gotas: pegar a cor de um ponto da foto ---------- */
+function mbEyedrop(cb, only) {
+  const b = mbBoard(); if (!b || !b.items.some((i) => i.type === "image" && i.src)) { toast("Coloque uma foto primeiro."); return; }
+  if (BRD.crop) endCrop(); if (BRD.editing) endTextEdit();
+  BRD.pick = { cb, only };
+  $("#mbArea").classList.add("picking"); $("#mbPick").hidden = false; placeSel(); hideCtx();
+}
+function mbPickEnd() { if (!BRD) return; BRD.pick = null; $("#mbArea")?.classList.remove("picking"); const p = $("#mbPick"); if (p) p.hidden = true; placeSel(); showCtx(); }
+async function mbSampleAt(cx, cy) {
+  const P = BRD.pick; if (!P) return;
+  const el = document.elementsFromPoint(cx, cy).find((x) => x.matches && x.matches("#mbCanvas > .mb-image:not(.empty)") && (!P.only || x.dataset.it === P.only));
+  if (!el) { toast(P.only ? "Toque dentro da foto selecionada" : "Toque em cima de uma foto"); return; }
+  const it = mbItem(el.dataset.it), b = mbBoard(); if (!it) return;
+  const img = await mbLoadImg(it.src); if (!img || !BRD.pick) return;
+  const r = el.getBoundingClientRect(), c = cropBox({ ...it, ia: it.ia || img.naturalWidth / img.naturalHeight }, b);
+  const dl = r.left + (c.l / 100) * r.width, dt = r.top + (c.t / 100) * r.height, dw = (c.w / 100) * r.width, dh = (c.h / 100) * r.height;
+  const hex = sampleImg(img, clamp((cx - dl) / dw, 0, 1), clamp((cy - dt) / dh, 0, 1));
+  mbPickEnd();
+  if (hex) P.cb(hex);
+}
+
+/* ---------- seletor de cor (popover) ---------- */
+function colorPop(anchor, cur, cb, o = {}) {
+  const b = mbBoard(), c0 = normHex(cur) || "#e9c7c0";
+  const used = b ? [...new Set(b.items.filter((i) => i.type === "color").map((i) => (i.color || "").toLowerCase()))].slice(0, 16) : [];
+  const photos = b && b.items.some((i) => i.type === "image" && i.src);
+  const sw = (c) => `<button class="mb-sw${c.toLowerCase() === c0 ? " on" : ""}" data-c="${c}" style="background:${c}" title="${c.toUpperCase()}" aria-label="${c.toUpperCase()}"></button>`;
+  const p = popover(anchor, `<div class="mb-cpop">
+    <div class="mb-ptitle">${esc(o.title || "Cor")}</div>
+    ${used.length ? `<div class="mb-plabel">Cores deste moodboard</div><div class="mb-swatches">${used.map(sw).join("")}</div>` : ""}
+    <div class="mb-plabel">Sugestões</div><div class="mb-swatches">${MB_SWATCHES.map(sw).join("")}</div>
+    <div class="mb-crow"><label class="mb-cnat" title="Escolher qualquer cor"><input type="color" value="${c0}"><span style="background:${c0}"></span></label>
+      <input class="field mb-chex" value="${c0.toUpperCase()}" maxlength="7" spellcheck="false" autocomplete="off" aria-label="Código da cor">
+      <button class="btn sm primary" data-cok>OK</button></div>
+    ${photos ? `<button class="mi mb-cpick" data-cpick>${ic("pipette")}Pegar a cor de uma foto</button>` : ""}
+  </div>`);
+  const done = (c) => { closePop(); cb(c.toLowerCase()); };
+  const hx = $(".mb-chex", p), nat = $("input[type=color]", p), dot = $(".mb-cnat span", p);
+  p.addEventListener("click", (e) => {
+    const s = e.target.closest("[data-c]"); if (s) return done(s.dataset.c);
+    if (e.target.closest("[data-cok]")) { const v = normHex(hx.value); if (v) done(v); else { hx.classList.add("bad"); hx.focus(); } return; }
+    if (e.target.closest("[data-cpick]")) { closePop(); mbEyedrop(cb); }
+  });
+  nat.addEventListener("input", () => { dot.style.background = nat.value; hx.value = nat.value.toUpperCase(); hx.classList.remove("bad"); });
+  nat.addEventListener("change", () => done(nat.value));
+  hx.addEventListener("input", () => { const v = normHex(hx.value); hx.classList.toggle("bad", !v && hx.value.replace("#", "").length >= 6); if (v) { dot.style.background = v; nat.value = v; } });
+  hx.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); const v = normHex(hx.value); if (v) done(v); else hx.classList.add("bad"); } });
+}
 
 /* ---------- paleta automática ---------- */
-async function mbAutoPalette() {
-  const n = S.notes.get(BRD.id);
-  const imgs = n.board.items.filter((i) => i.type === "image" && i.src);
-  if (!imgs.length) { toast("Adicione fotos primeiro pra extrair as cores."); return; }
-  toast("Extraindo as cores das fotos…");
-  const colors = await extractColors(imgs.map((i) => i.src), 5);
-  if (!colors.length) { toast("Não consegui extrair cores agora."); return; }
-  const row = paletteRow(90, colors.length, colors);
-  const base = topZ(n);
-  row.forEach((r, i) => { r.z = base + 1 + i; n.board.items.push(r); });
-  boardChanged(n);
-  toast(plural(colors.length, "cor adicionada", "cores adicionadas"));
-}
-function extractColors(srcs, k) {
-  return new Promise((resolve) => {
-    const counts = new Map(); let pending = srcs.length;
-    const done = () => {
-      const arr = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-      const picked = [];
-      for (const [key] of arr) {
-        const [r, g, b] = key.split(",").map(Number);
-        if (picked.every((p) => Math.abs(p[0] - r) + Math.abs(p[1] - g) + Math.abs(p[2] - b) > 60)) picked.push([r, g, b]);
-        if (picked.length >= k) break;
-      }
-      resolve(picked.map(([r, g, b]) => "#" + [r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("")));
-    };
-    srcs.forEach((src) => {
-      const img = new Image();
-      img.onload = () => {
-        try {
-          const s = 32, c = document.createElement("canvas"); c.width = s; c.height = s;
-          const ctx = c.getContext("2d"); ctx.drawImage(img, 0, 0, s, s);
-          const d = ctx.getImageData(0, 0, s, s).data;
-          for (let i = 0; i < d.length; i += 4) {
-            const a = d[i + 3]; if (a < 128) continue;
-            const r = Math.round(d[i] / 24) * 24, g = Math.round(d[i + 1] / 24) * 24, bl = Math.round(d[i + 2] / 24) * 24;
-            const mx = Math.max(r, g, bl), mn = Math.min(r, g, bl);
-            if (mx > 240 && mn > 240) continue; // ignora branco puro
-            if (mx < 18) continue;              // ignora preto puro
-            const key = r + "," + g + "," + bl; counts.set(key, (counts.get(key) || 0) + 1);
-          }
-        } catch (e) {}
-        if (--pending === 0) done();
-      };
-      img.onerror = () => { if (--pending === 0) done(); };
-      img.src = src;
-    });
-  });
-}
-
-/* ---------- editar texto ---------- */
-function editBoardText(it) {
-  const n = S.notes.get(BRD.id);
-  const m = modal(`<div class="m-head"><div class="m-ic">${ic("type")}</div><h2>Texto</h2><button class="ib" id="txX" aria-label="Fechar">${ic("x")}</button></div>
-    <div class="m-body mb-txtedit">
-      <textarea class="field" id="txT" rows="2" placeholder="Escreva aqui">${esc(it.text || "")}</textarea>
-      <div class="mb-row"><label>Fonte<select class="field" id="txF">${BOARD_FONTS.map(([v, l]) => `<option value="${v}"${it.font === v ? " selected" : ""}>${l}</option>`).join("")}</select></label>
-        <label>Tamanho<select class="field" id="txS">${[3, 4, 5, 6, 8, 10, 12].map((s) => `<option value="${s}"${(it.size || 6) === s ? " selected" : ""}>${s === 3 ? "Pequeno" : s === 4 ? "Médio" : s === 6 ? "Grande" : s === 8 ? "Enorme" : s >= 10 ? "Gigante" : s}</option>`).join("")}</select></label></div>
-      <div class="mb-row"><label>Peso<select class="field" id="txW">${[["400", "Fina"], ["600", "Média"], ["700", "Negrito"], ["800", "Pesada"]].map(([v, l]) => `<option value="${v}"${String(it.weight || 600) === v ? " selected" : ""}>${l}</option>`).join("")}</select></label>
-        <label>Alinhar<div class="seg mb-seg" id="txA">${[["left", "Esq."], ["center", "Centro"], ["right", "Dir."]].map(([v, l]) => `<button type="button" data-a="${v}" class="${(it.align || "left") === v ? "on" : ""}">${l}</button>`).join("")}</div></label></div>
-      <div class="mb-row"><label>Cor<button class="btn" id="txC"><span class="mb-bgdot" style="background:${esc(it.color || "#20151a")}"></span>Escolher</button></label></div>
-    </div>`, { wide: false });
-  const upd = () => { boardChanged(n); };
-  $("#txT", m).oninput = (e) => { it.text = e.target.value; upd(); };
-  $("#txF", m).onchange = (e) => { it.font = e.target.value; upd(); };
-  $("#txS", m).onchange = (e) => { it.size = +e.target.value; upd(); };
-  $("#txW", m).onchange = (e) => { it.weight = +e.target.value; upd(); };
-  $("#txA", m).addEventListener("click", (e) => { const b = e.target.closest("[data-a]"); if (!b) return; it.align = b.dataset.a; $$("#txA button", m).forEach((x) => x.classList.toggle("on", x === b)); upd(); });
-  $("#txC", m).onclick = () => pickColor(it.color || "#20151a", (col) => { it.color = col; $("#txC .mb-bgdot", m).style.background = col; upd(); });
-  $("#txX", m).onclick = () => m.close();
-  setTimeout(() => { const t = $("#txT", m); if (t) { t.focus(); t.select(); } }, 60);
-}
-
-/* ---------- seletor de cor ---------- */
-const MB_SWATCHES = ["#20151a", "#ffffff", "#f6d5cf", "#e9a7a0", "#d46a7e", "#c0304f", "#b8142e", "#7a1f2b", "#e8c9a0", "#c99a6a", "#a7703f", "#5a3a28", "#f3e7df", "#cdb4a0", "#9a8b7a", "#2b2b2b"];
-function pickColor(cur, cb) {
-  const m = modal(`<div class="m-head"><div class="m-ic">${ic("palette")}</div><h2>Escolher cor</h2><button class="ib" id="pcX" aria-label="Fechar">${ic("x")}</button></div>
-    <div class="m-body"><div class="mb-swatches">${MB_SWATCHES.map((c) => `<button class="mb-sw${c.toLowerCase() === (cur || "").toLowerCase() ? " on" : ""}" data-c="${c}" style="background:${c}" aria-label="${c}"></button>`).join("")}</div>
-      <label class="mb-custom">Personalizada<input type="color" id="pcCustom" value="${/^#[0-9a-f]{6}$/i.test(cur || "") ? cur : "#e9c7c0"}"></label></div>`, { wide: false });
-  const choose = (c) => { m.close(); cb(c); };
-  m.addEventListener("click", (e) => { if (e.target.closest("#pcX")) return m.close(); const b = e.target.closest("[data-c]"); if (b) choose(b.dataset.c); });
-  $("#pcCustom", m).oninput = (e) => { $$(".mb-sw", m).forEach((x) => x.classList.remove("on")); };
-  $("#pcCustom", m).onchange = (e) => choose(e.target.value);
-}
-
-/* ---------- fundo do board ---------- */
-function mbBackground() { const n = S.notes.get(BRD.id); pickColor(n.board.bg, (col) => { n.board.bg = col; n.updated = Date.now(); markNote(n.id); const cv = $("#mbCanvas"); if (cv) cv.style.background = col; const d = $(".mb-bgdot", $("#mbTools")); if (d) d.style.background = col; }); }
-
-/* ---------- wiring da toolbar ---------- */
-function mbToolbarClick(k) {
-  if (k === "addimg") return mbAddImage();
-  if (k === "addtext") return mbAddText();
-  if (k === "addcolor") return mbAddColor();
-  if (k === "palette") return mbAutoPalette();
-  if (k === "bg") return mbBackground();
-  if (k === "export") return exportBoard();
-}
-
-/* ---------- exportar como imagem ---------- */
-async function exportBoard() {
-  const n = S.notes.get(BRD.id); if (!n) return;
-  toast("Gerando a imagem…");
-  try { await document.fonts.ready; } catch (e) {}
-  const b = n.board, W = 1200, H = Math.round(W * (b.ratio || 1.25));
-  const c = document.createElement("canvas"); c.width = W; c.height = H;
-  const ctx = c.getContext("2d");
-  ctx.fillStyle = b.bg || "#faf6f4"; ctx.fillRect(0, 0, W, H);
-  const its = [...(b.items || [])].sort((a, b2) => (a.z || 0) - (b2.z || 0));
-  const loadImg = (src) => new Promise((res) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = src; });
-  for (const it of its) {
-    const x = it.x / 100 * W, y = it.y / 100 * H, w = it.w / 100 * W, h = it.type === "color" ? it.w / 100 * W : it.h / 100 * H;
-    if (it.type === "image" && it.src) {
-      const img = await loadImg(it.src); if (!img) continue;
-      ctx.save(); roundRect(ctx, x, y, w, h, (it.rad || 10) / 100 * W); ctx.clip();
-      const ir = img.width / img.height, br = w / h; let sw = img.width, sh = img.height, sx = 0, sy = 0;
-      if (ir > br) { sw = img.height * br; sx = (img.width - sw) / 2; } else { sh = img.width / br; sy = (img.height - sh) / 2; }
-      ctx.drawImage(img, sx, sy, sw, sh, x, y, w, h); ctx.restore();
-    } else if (it.type === "color") {
-      ctx.save(); const r = (it.rad != null ? it.rad : 50) >= 50 ? Math.min(w, h) / 2 : (it.rad || 0) / 100 * W; roundRect(ctx, x, y, w, h, r); ctx.fillStyle = it.color || "#ccc"; ctx.fill(); ctx.restore();
-    } else if (it.type === "text") {
-      const fs = (it.size || 6) / 100 * W;
-      ctx.fillStyle = it.color || "#20151a"; ctx.textBaseline = "top";
-      ctx.font = `${it.weight || 600} ${fs}px ${boardFontCss(it.font).replace(/var\(--ui\)/, "system-ui")}`;
-      const align = it.align || "left"; ctx.textAlign = align;
-      const tx = align === "center" ? x + w / 2 : align === "right" ? x + w : x;
-      const lh = fs * 1.18, lines = wrapLines(ctx, it.text || "", w);
-      let ty = y + Math.max(0, (h - lines.length * lh) / 2);
-      lines.forEach((ln) => { ctx.fillText(ln, tx, ty); ty += lh; });
+async function extractPalette(srcs, N) {
+  const P = [];
+  for (const src of srcs) {
+    const img = await mbLoadImg(src); if (!img) continue;
+    const k = Math.min(1, 64 / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * k)), h = Math.max(1, Math.round(img.naturalHeight * k));
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const x = c.getContext("2d", { willReadFrequently: true }); x.drawImage(img, 0, 0, w, h);
+    let d; try { d = x.getImageData(0, 0, w, h).data; } catch (e) { continue; }
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] < 200) continue;
+      const lab = rgb2lab(d[i], d[i + 1], d[i + 2]), C = Math.hypot(lab[1], lab[2]);
+      let wt = 0.55 + Math.min(C, 70) / 70;
+      if (lab[0] < 9) wt *= 0.08; else if (lab[0] < 18) wt *= 0.4;
+      if (lab[0] > 96 && C < 6) wt *= 0.1; else if (C < 5) wt *= 0.5;
+      P.push(lab[0], lab[1], lab[2], d[i], d[i + 1], d[i + 2], wt);
     }
   }
-  c.toBlob((blob) => {
-    if (!blob) { toast("Não consegui gerar a imagem."); return; }
-    const url = URL.createObjectURL(blob), a = document.createElement("a");
-    a.href = url; a.download = (titleOf(n).replace(/[^\w\s-]/g, "").trim() || "moodboard") + ".png";
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-    toast("Imagem exportada ✨");
-  }, "image/png");
+  const M = P.length / 7; if (!M) return [];
+  const K = Math.min(M, Math.max(12, N * 3));
+  let seed = 987654321; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const Wt = new Float32Array(M); let tw = 0; for (let i = 0; i < M; i++) { Wt[i] = P[i * 7 + 6]; tw += Wt[i]; }
+  let r = rnd() * tw, j = 0; for (; j < M - 1; j++) { r -= Wt[j]; if (r <= 0) break; }
+  const cen = [[P[j * 7], P[j * 7 + 1], P[j * 7 + 2]]], D = new Float32Array(M).fill(Infinity);
+  while (cen.length < K) {
+    const c = cen[cen.length - 1]; let tot = 0;
+    for (let i = 0; i < M; i++) { const o = i * 7, a = P[o] - c[0], bb = P[o + 1] - c[1], cc = P[o + 2] - c[2], dd = a * a + bb * bb + cc * cc; if (dd < D[i]) D[i] = dd; tot += D[i] * Wt[i]; }
+    if (tot <= 0) break;
+    let rr = rnd() * tot, pick = M - 1; for (let i = 0; i < M; i++) { rr -= D[i] * Wt[i]; if (rr <= 0) { pick = i; break; } }
+    cen.push([P[pick * 7], P[pick * 7 + 1], P[pick * 7 + 2]]);
+  }
+  for (let iter = 0; iter < 12; iter++) {
+    const S7 = cen.map(() => [0, 0, 0, 0, 0, 0, 0]);
+    for (let i = 0; i < M; i++) {
+      const o = i * 7; let bi = 0, bd = Infinity;
+      for (let q = 0; q < cen.length; q++) { const c = cen[q], a = P[o] - c[0], bb = P[o + 1] - c[1], cc = P[o + 2] - c[2], dd = a * a + bb * bb + cc * cc; if (dd < bd) { bd = dd; bi = q; } }
+      const w = P[o + 6], s = S7[bi]; s[0] += P[o] * w; s[1] += P[o + 1] * w; s[2] += P[o + 2] * w; s[3] += P[o + 3] * w; s[4] += P[o + 4] * w; s[5] += P[o + 5] * w; s[6] += w;
+    }
+    cen.forEach((c, q) => { const s = S7[q]; if (s[6] > 0) { c[0] = s[0] / s[6]; c[1] = s[1] / s[6]; c[2] = s[2] / s[6]; c.rgb = [s[3] / s[6], s[4] / s[6], s[5] / s[6]]; } c.w = s[6]; });
+  }
+  const cl = cen.filter((c) => c.w > 0 && c.rgb).map((c) => ({ lab: c, rgb: c.rgb, score: c.w * (0.75 + Math.min(Math.hypot(c[1], c[2]), 60) / 80) })).sort((a, c) => c.score - a.score);
+  const out = [];
+  for (const th of [16, 10, 5, 0]) { for (const c of cl) { if (out.length >= N) break; if (!out.includes(c) && out.every((o) => dE(o.lab, c.lab) >= th)) out.push(c); } if (out.length >= N) break; }
+  out.sort((a, c) => c.lab[0] - a.lab[0]);
+  return out.map((c) => hexOf(c.rgb));
 }
-function roundRect(ctx, x, y, w, h, r) { r = Math.min(r, w / 2, h / 2); ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+async function mbGeneratePalette(N) {
+  const n = mbNote(); if (!n) return;
+  const b = n.board, srcs = [...new Set(b.items.filter((i) => i.type === "image" && i.src).map((i) => i.src))];
+  if (!srcs.length) { toast("Coloque algumas fotos primeiro — as cores saem delas."); return; }
+  const colors = await extractPalette(srcs, N);
+  if (!mbActive() || mbNote() !== n) return;
+  if (!colors.length) { toast("Não consegui tirar as cores dessas fotos."); return; }
+  b.items = b.items.filter((i) => !(i.type === "color" && i.pal));
+  const z = topZ(b);
+  colors.forEach((c, i) => b.items.push({ id: uid("mb_"), type: "color", color: c, pal: true, pi: i, x: 0, y: 0, w: 10, z: z + 1 + i }));
+  b.palN = N; layoutPalette(b); BRD.sel = null; mbFit(); mbCommit({ anim: true });
+  toast(`Paleta com ${colors.length} cores criada`);
+}
+function palettePop(btn) {
+  const b = mbBoard(); let N = b.palN || 5;
+  const has = palItems(b).length;
+  const p = popover(btn, `<div class="mb-ppop">
+    <div class="mb-ptitle">${ic("palette")}Paleta das fotos</div>
+    <div class="mb-plabel">Quantas cores</div>
+    <div class="mb-pseg">${[3, 4, 5, 6, 7, 8].map((k) => `<button data-pn="${k}" class="${k === N ? "on" : ""}">${k}</button>`).join("")}</div>
+    <label class="mb-ptog"><input type="checkbox" id="pHex" ${b.hex ? "checked" : ""}><span class="tg"></span>Mostrar o código de cada cor</label>
+    <button class="btn primary mb-pgo" data-pgo>${ic("palette")}${has ? "Gerar a paleta de novo" : "Gerar a paleta"}</button>
+    <p class="mb-phint">As cores saem das suas fotos. Depois dá para trocar, apagar ou arrastar cada uma — e o botão Cor adiciona mais.</p>
+  </div>`);
+  p.addEventListener("click", (e) => {
+    const k = e.target.closest("[data-pn]"); if (k) { N = +k.dataset.pn; $$("[data-pn]", p).forEach((x) => x.classList.toggle("on", x === k)); return; }
+    if (e.target.closest("[data-pgo]")) { closePop(); mbGeneratePalette(N); }
+  });
+  $("#pHex", p).addEventListener("change", (e) => { const bb = mbBoard(); bb.hex = e.target.checked; if (!bb.hex) delete bb.hex; layoutPalette(bb); mbFit(); mbCommit({ anim: true }); });
+}
+
+/* ---------- Folha: formato, fundo, espaçamento, cantos ---------- */
+function mbSetRatio(r) {
+  const b = mbBoard(); if (Math.abs((b.ratio || 1.25) - r) < 0.001) return;
+  b.ratio = r3(r); if (b.grid) layoutGrid(b); layoutPalette(b, { noGrow: true });
+  mbFit(true); mbCommit({ anim: true });
+  const cv = $("#mbCanvas"); if (cv) cv.animate([{ opacity: 0.55, transform: "scale(.985)" }, { opacity: 1, transform: "none" }], { duration: 300, easing: "cubic-bezier(.22,1,.36,1)" });
+}
+function sheetPop(btn) {
+  const b = mbBoard(), imgs = b.items.filter((i) => i.type === "image");
+  const rad = b.grid ? b.grid.rad : imgs.length ? imgs[0].rad || 0 : 1.4;
+  const p = popover(btn, `<div class="mb-fpop">
+    <div class="mb-ptitle">${ic("sliders")}Folha</div>
+    <div class="mb-plabel">Formato</div>
+    <div class="mb-fratios">${MB_RATIOS.map(([nm, lb, r]) => `<button class="${Math.abs((b.ratio || 1.25) - r) < 0.02 ? "on" : ""}" data-fr="${r}"><i style="aspect-ratio:${(1 / r).toFixed(3)}"></i><b>${nm}</b><span>${lb}</span></button>`).join("")}</div>
+    <div class="mb-plabel">Fundo</div>
+    <div class="mb-swatches mb-fbgs">${MB_BGS.map((c) => `<button class="mb-sw${c === (b.bg || "").toLowerCase() ? " on" : ""}" data-fbg="${c}" style="background:${c}" aria-label="Fundo ${c}"></button>`).join("")}<button class="mb-sw mb-swmore" data-fbgmore title="Outra cor" aria-label="Outra cor">${ic("plus")}</button></div>
+    ${b.grid ? `<div class="mb-plabel">Espaço entre as fotos <span id="fGapV">${Math.round(b.grid.gap * 10)}</span></div><input type="range" class="mb-range" id="fGap" min="0" max="8" step="0.1" value="${b.grid.gap}">` : ""}
+    ${imgs.length ? `<div class="mb-plabel">Cantos das fotos <span id="fRadV">${Math.round(rad * 10)}</span></div><input type="range" class="mb-range" id="fRad" min="0" max="8" step="0.1" value="${rad}">` : ""}
+    <hr><button class="mi" data-fsave>${ic("template")}Salvar como modelo…</button>
+  </div>`);
+  p.addEventListener("click", (e) => {
+    const fr = e.target.closest("[data-fr]"); if (fr) { $$("[data-fr]", p).forEach((x) => x.classList.toggle("on", x === fr)); mbSetRatio(+fr.dataset.fr); return; }
+    const bg = e.target.closest("[data-fbg]"); if (bg) { $$("[data-fbg]", p).forEach((x) => x.classList.toggle("on", x === bg)); mbBoard().bg = bg.dataset.fbg; mbCommit(); return; }
+    if (e.target.closest("[data-fbgmore]")) { colorPop(btn, mbBoard().bg, (c) => { mbBoard().bg = c; mbCommit(); }, { title: "Cor do fundo" }); return; }
+    if (e.target.closest("[data-fsave]")) { closePop(); mbSaveTemplate(); }
+  });
+  const gap = $("#fGap", p);
+  if (gap) { gap.addEventListener("input", () => { const bb = mbBoard(); bb.grid.gap = +gap.value; $("#fGapV", p).textContent = Math.round(bb.grid.gap * 10); layoutGrid(bb); layoutPalette(bb, { noGrow: true }); syncBoard({ quiet: true }); }); gap.addEventListener("change", () => mbCommit()); }
+  const rr = $("#fRad", p);
+  if (rr) { rr.addEventListener("input", () => { const bb = mbBoard(), v = +rr.value; $("#fRadV", p).textContent = Math.round(v * 10); bb.items.forEach((i) => { if (i.type === "image") i.rad = v; }); if (bb.grid) bb.grid.rad = v; syncBoard({ quiet: true }); }); rr.addEventListener("change", () => mbCommit()); }
+}
+async function mbSaveTemplate() {
+  const n = mbNote(); if (!n) return;
+  const r = await ask({ title: "Salvar como modelo", icon: "template", text: "O layout vai para “Meus modelos” na hora de criar um moodboard — no PC e no celular.", input: "Nome do modelo", value: (n.title || "").trim() || "Meu modelo", ok: "Salvar",
+    extra: `<label class="mb-askopt">O que salvar<select class="field" data-extra><option value="0">Só o layout (sem as fotos)</option><option value="1">O layout com as fotos</option></select></label>` });
+  if (!r || !r.v) return;
+  const b = snap(n.board), keep = r.extra === "1";
+  b.items.forEach((it) => { delete it.locked; if (!keep && it.type === "image") { it.src = ""; delete it.ia; delete it.fx; delete it.fy; delete it.zoom; } });
+  S.prefs.boardTpls = [{ id: uid("bt_"), name: r.v.slice(0, 60), board: b, created: Date.now() }, ...(S.prefs.boardTpls || [])].slice(0, 40);
+  savePrefs(); sysPush();
+  toast(`Modelo “${r.v.slice(0, 60)}” salvo`);
+}
+
+/* ---------- exportar / imagem ---------- */
+function roundRect(ctx, x, y, w, h, r) { r = Math.max(0, Math.min(r, w / 2, h / 2)); ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
 function wrapLines(ctx, text, maxW) {
   const out = [];
   String(text).split("\n").forEach((para) => {
@@ -4057,10 +4851,247 @@ function wrapLines(ctx, text, maxW) {
   });
   return out;
 }
+async function mbRenderCanvas(board, W) {
+  try { await document.fonts.ready; } catch (e) {}
+  const b = mbMigrate(board), R = b.ratio || 1.25, H = Math.round(W * R);
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const x = c.getContext("2d");
+  x.fillStyle = b.bg || "#faf6f4"; x.fillRect(0, 0, W, H);
+  const its = [...b.items].sort((a, d) => (a.z || 0) - (d.z || 0));
+  for (const it of its) {
+    const X = (it.x / 100) * W, Y = (it.y / 100) * H, IW = (it.w / 100) * W;
+    if (it.type === "image") {
+      if (!it.src) continue;
+      const img = await mbLoadImg(it.src); if (!img) continue;
+      const IH = (it.h / 100) * H, cb = cropBox({ ...it, ia: it.ia || img.naturalWidth / img.naturalHeight }, b);
+      x.save(); roundRect(x, X, Y, IW, IH, ((it.rad || 0) / 100) * W); x.clip();
+      x.drawImage(img, X + (cb.l / 100) * IW, Y + (cb.t / 100) * IH, (cb.w / 100) * IW, (cb.h / 100) * IH);
+      x.restore();
+    } else if (it.type === "color") {
+      x.beginPath(); x.arc(X + IW / 2, Y + IW / 2, IW / 2, 0, Math.PI * 2); x.fillStyle = it.color || "#ccc"; x.fill();
+      if (b.hex) {
+        const fs = 0.019 * W; x.font = `600 ${fs}px ${MB_UI}`; x.fillStyle = hexLabelColor(b.bg || "#fff"); x.textAlign = "center"; x.textBaseline = "top";
+        if ("letterSpacing" in x) x.letterSpacing = 0.04 * fs + "px";
+        x.fillText((it.color || "").toUpperCase(), X + IW / 2, Y + IW + 0.009 * W);
+        if ("letterSpacing" in x) x.letterSpacing = "0px";
+      }
+    } else if (it.type === "text") {
+      const fs = ((it.size || 5) / 100) * W, align = it.align || "left";
+      x.fillStyle = it.color || "#20151a";
+      x.font = `${it.italic ? "italic " : ""}${it.weight || 600} ${fs}px ${boardFontCss(it.font, true)}`;
+      if ("letterSpacing" in x) x.letterSpacing = (it.ls || 0) * fs + "px";
+      x.textAlign = align; x.textBaseline = "middle";
+      const tx = align === "center" ? X + IW / 2 : align === "right" ? X + IW : X, lh = fs * 1.15;
+      wrapLines(x, it.caps ? (it.text || "").toUpperCase() : it.text || "", IW).forEach((ln, i) => x.fillText(ln, tx, Y + lh * (i + 0.5)));
+      if ("letterSpacing" in x) x.letterSpacing = "0px";
+    }
+  }
+  return c;
+}
+const boardFileName = (n) => (titleOf(n).replace(/[\\/:*?"<>|]+/g, "").trim() || "moodboard").slice(0, 80);
+async function boardBlob(n, type = "image/png", W = 1800) { const c = await mbRenderCanvas(n.board, W); return new Promise((res) => c.toBlob(res, type, 0.92)); }
+async function mbExport(id) {
+  const n = S.notes.get(id || S.active); if (!n || n.kind !== "moodboard") return;
+  if (mbActive() && BRD.editing) endTextEdit();
+  toast("Gerando a imagem…");
+  const blob = await boardBlob(n);
+  if (!blob) { toast("Não consegui gerar a imagem."); return; }
+  const url = URL.createObjectURL(blob), a = document.createElement("a");
+  a.href = url; a.download = boardFileName(n) + ".png"; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  toast("Imagem salva ✨");
+}
+async function mbCopyImage(n) {
+  try { const blob = await boardBlob(n, "image/png", 1600); await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]); toast("Imagem copiada — é só colar no WhatsApp, e-mail…"); }
+  catch (e) { toast("Não deu para copiar a imagem aqui. Use “Baixar imagem”."); }
+}
+async function mbShareImage(n) {
+  try {
+    const blob = await boardBlob(n, "image/jpeg", 1600), file = new File([blob], boardFileName(n) + ".jpg", { type: "image/jpeg" });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: titleOf(n) }); return; }
+    toast("Este aparelho não envia imagens direto. Use “Baixar imagem”.");
+  } catch (e) { if (e && e.name !== "AbortError") toast("Não consegui enviar a imagem."); }
+}
 
 /* ---------- miniatura/snippet pra lista ---------- */
-function boardThumb(n) { const it = (n.board && n.board.items || []).filter((i) => i.type === "image" && i.src).sort((a, b) => (a.z || 0) - (b.z || 0))[0]; return it ? it.src : null; }
-function boardCount(n) { const its = (n.board && n.board.items) || []; const ph = its.filter((i) => i.type === "image" && i.src).length; return ph; }
+function boardThumb(n) { const it = ((n.board && n.board.items) || []).filter((i) => i.type === "image" && i.src).sort((a, b) => (a.z || 0) - (b.z || 0))[0]; return it ? it.src : null; }
+function boardCount(n) { return ((n.board && n.board.items) || []).filter((i) => i.type === "image" && i.src).length; }
+
+/* =========================================================
+   Compartilhar: link público, só leitura, sempre atualizado
+   ========================================================= */
+const SHARE_DEFAULT_BASE = "https://davigerhardt.github.io/ForeverNote/";
+const SYS_ID = "__sys";
+const SHARE_T = new Map(), SHARE_PUB = new Map();
+function shareBase() {
+  if (WEB && /^https:$/.test(location.protocol)) return new URL(".", location.href).href;
+  return S.prefs.webBase || SHARE_DEFAULT_BASE;
+}
+const shareUrl = (tok) => shareBase() + "ver.html?n=" + encodeURIComponent(tok);
+function newShareToken() { const A = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789", a = new Uint8Array(22); crypto.getRandomValues(a); return [...a].map((x) => A[x % A.length]).join(""); }
+function shareBtnsHTML(n) {
+  if (!n || n.tplEdit || n.trashed) return "";
+  const on = !!(n.share && n.share.id);
+  return `<div class="share-split${on ? " on" : ""}" id="shareSplit"><button class="share-main" data-act="share" title="Compartilhar">${ic("share")}<span>Compartilhar</span></button><button class="share-link" data-act="sharelink" title="${on ? "Copiar o link" : "Criar e copiar o link"}" aria-label="Copiar o link">${ic("link")}</button></div>`;
+}
+function refreshShareBtns(n) {
+  const sp = $("#shareSplit"); if (!sp || S.active !== n.id) return;
+  const on = !!(n.share && n.share.id);
+  sp.classList.toggle("on", on); const l = sp.querySelector(".share-link"); if (l) l.title = on ? "Copiar o link" : "Criar e copiar o link";
+}
+const isMissing = (e) => !!e && (["42P01", "42883", "PGRST202", "PGRST205"].includes(e.code) || /does not exist|could not find/i.test(e.message || ""));
+function shareErrMsg(e) {
+  if (e && e.code === "login") return "Entre na sua conta para criar links.";
+  if ((e && e.code === "offline") || navigator.onLine === false) return "Sem internet agora — tente de novo quando conectar.";
+  if (isMissing(e)) return "O compartilhamento ainda não foi ligado no servidor (falta rodar o código no Supabase).";
+  if (e && /payload|too large|413/i.test(e.message || "")) return "Esta nota ficou grande demais para o link (imagens pesadas).";
+  return "Não consegui criar o link agora. Tente de novo.";
+}
+async function shareInlineImg(src) {
+  try {
+    let data = src;
+    if (/^anexo:/i.test(src)) { const name = decodeURIComponent(src.replace(/^anexo:\/\/img\//i, "")); data = api.imageData ? await api.imageData(name) : null; }
+    else if (/^blob:/i.test(src)) { const bl = await (await fetch(src)).blob(); data = await new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.onerror = () => r(null); fr.readAsDataURL(bl); }); }
+    if (/^https:/i.test(src) && data === src) return src;
+    if (!/^data:image\//i.test(data || "")) return null;
+    if (data.length < 450000) return data;
+    const img = await mbLoadImg(data); if (!img) return null;
+    const k = Math.min(1, 1400 / Math.max(img.naturalWidth, img.naturalHeight)), c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k));
+    const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height); x.drawImage(img, 0, 0, c.width, c.height);
+    return c.toDataURL("image/jpeg", 0.84);
+  } catch (e) { return null; }
+}
+async function shareHTML(html) {
+  const box = document.createElement("div"); box.innerHTML = html || "";
+  box.querySelectorAll(".audio-block").forEach((a) => { const p = document.createElement("p"); p.className = "sh-audio"; p.textContent = "Gravação de áudio (só no app)"; a.replaceWith(p); });
+  box.querySelectorAll("a.note-link").forEach((a) => a.replaceWith(document.createTextNode(a.textContent)));
+  box.querySelectorAll("a.file-link").forEach((a) => { const s = document.createElement("span"); s.className = "sh-file"; s.textContent = a.textContent; a.replaceWith(s); });
+  box.querySelectorAll("[contenteditable],[data-state],[data-ph]").forEach((x) => { x.removeAttribute("contenteditable"); x.removeAttribute("data-state"); x.removeAttribute("data-ph"); });
+  for (const img of [...box.querySelectorAll("img")]) { img.classList.remove("selected"); const d = await shareInlineImg(img.getAttribute("src") || ""); if (d) img.setAttribute("src", d); else img.remove(); }
+  return box.innerHTML;
+}
+async function shareSnapshot(n) {
+  if (n.kind === "moodboard") {
+    const b = mbMigrate(n.board), c = await mbRenderCanvas(b, 1400);
+    const cols = [...palItems(b).sort((a, d) => (a.pi || 0) - (d.pi || 0)), ...b.items.filter((i) => i.type === "color" && !i.pal)].map((i) => (i.color || "").toLowerCase());
+    return { kind: "moodboard", title: (n.title || "").trim(), img: c.toDataURL("image/jpeg", 0.88), w: c.width, h: c.height, colors: [...new Set(cols)], updated: n.updated || Date.now() };
+  }
+  return { kind: "note", title: (n.title || "").trim(), html: await shareHTML(n.html), updated: n.updated || Date.now() };
+}
+async function sharePublish(n) {
+  if (!SB || !CLOUD.user) throw Object.assign(new Error("login"), { code: "login" });
+  if (navigator.onLine === false) throw Object.assign(new Error("offline"), { code: "offline" });
+  const data = await shareSnapshot(n);
+  const { error } = await SB.from("shares").upsert({ id: n.share.id, user_id: CLOUD.user.id, note_id: n.id, data, created: n.share.created || Date.now(), updated: Date.now() }, { onConflict: "id" });
+  if (error) throw error;
+  SHARE_PUB.set(n.id, n.updated);
+}
+async function shareEnable(n) {
+  if (n.share && n.share.id) { await sharePublish(n); return; }
+  n.share = { id: newShareToken(), created: Date.now() };
+  n.updated = Date.now();
+  try { await sharePublish(n); } catch (e) { delete n.share; throw e; }
+  markNote(n.id); refreshShareBtns(n);
+}
+async function shareDisable(n) {
+  if (!n.share) return;
+  if (SB && CLOUD.user) { const { error } = await SB.from("shares").delete().eq("id", n.share.id); if (error && !isMissing(error)) throw error; }
+  delete n.share; n.updated = Date.now(); markNote(n.id); refreshShareBtns(n);
+}
+function shareRefreshSoon(id) {
+  clearTimeout(SHARE_T.get(id));
+  SHARE_T.set(id, setTimeout(async () => {
+    SHARE_T.delete(id);
+    const n = S.notes.get(id); if (!n || !n.share || !n.share.id || n.trashed || SHARE_PUB.get(id) === n.updated) return;
+    try { await sharePublish(n); } catch (e) {}
+  }, 2500));
+}
+function openExt(url) { if (WEB && /^mailto:/i.test(url)) location.href = url; else api.openLink(url); }
+async function shareCopy(n) {
+  const url = shareUrl(n.share.id);
+  try { await navigator.clipboard.writeText(url); toast("Link copiado — quem abrir vê sempre a versão mais recente"); }
+  catch (e) { shareModal(n.id); }
+}
+async function shareQuickLink(id) {
+  const n = S.notes.get(id); if (!n) return;
+  if (!SB || !CLOUD.user) { shareModal(id); return; }
+  if (n.share && n.share.id) { shareCopy(n); return; }
+  const btn = $("#shareSplit .share-link"); if (btn) btn.classList.add("busy");
+  try { await shareEnable(n); await shareCopy(n); } catch (e) { toast(shareErrMsg(e)); }
+  finally { if (btn) btn.classList.remove("busy"); }
+}
+function shareBodyHTML(n) {
+  const logged = !!(SB && CLOUD.user), on = !!(n.share && n.share.id), url = on ? shareUrl(n.share.id) : "", board = n.kind === "moodboard";
+  return `
+    <div class="sh-title"><span class="sh-kind">${ic(board ? "board" : "notes")}</span><b>${esc(titleOf(n))}</b></div>
+    <section class="sh-sec">
+      <div class="sh-row"><div class="sh-ic">${ic("globe")}</div>
+        <div class="sh-txt"><b>Link para visualizar</b><span>${on ? `Quem tiver o link vê ${board ? "o moodboard" : "a nota"} no navegador — só leitura e sempre na versão mais recente.` : `Crie um link para alguém ver ${board ? "este moodboard" : "esta nota"} no navegador, sem precisar de conta.`}</span></div>
+        ${logged ? `<label class="sh-switch" title="${on ? "Desligar o link" : "Ligar o link"}"><input type="checkbox" id="shOn" ${on ? "checked" : ""}><span></span></label>` : ""}</div>
+      ${logged ? "" : `<div class="sh-need">${ic("lock")}<span>Para criar links, entre na sua conta de sincronização.</span><button class="btn primary sm" data-sh="login">Entrar</button></div>`}
+      ${on ? `<div class="sh-link"><input class="field" id="shUrl" value="${esc(url)}" readonly aria-label="Link"><button class="btn primary" data-sh="copy">${ic("copy")}Copiar</button></div>
+        <div class="sh-send"><button class="sh-chip" data-sh="whats">${ic("chat")}WhatsApp</button><button class="sh-chip" data-sh="mail">${ic("mail")}E-mail</button>${navigator.share ? `<button class="sh-chip" data-sh="more">${ic("share")}Mais opções</button>` : ""}<button class="sh-chip" data-sh="open">${ic("open")}Ver como fica</button></div>
+        <form class="sh-mail" id="shMail"><input class="field" type="email" id="shEmail" placeholder="Mandar por e-mail para…" autocomplete="email" inputmode="email"><button class="btn">${ic("mail")}Enviar</button></form>` : ""}
+    </section>
+    ${board ? `<section class="sh-sec"><div class="sh-row"><div class="sh-ic">${ic("image")}</div><div class="sh-txt"><b>Imagem do moodboard</b><span>Em alta qualidade, para mandar ou postar.</span></div></div>
+      <div class="sh-send">${navigator.canShare && WEB ? `<button class="sh-chip" data-sh="imgshare">${ic("share")}Enviar imagem</button>` : ""}<button class="sh-chip" data-sh="imgcopy">${ic("copy")}Copiar imagem</button><button class="sh-chip" data-sh="imgsave">${ic("download")}Baixar imagem</button></div></section>` : ""}`;
+}
+function shareModal(id) {
+  const n = S.notes.get(id); if (!n) return;
+  if (mbActive() && BRD.editing) endTextEdit();
+  const m = modal(`<div class="m-head"><div class="m-ic">${ic("share")}</div><h2>Compartilhar</h2><button class="ib" id="shX" aria-label="Fechar">${ic("x")}</button></div><div class="m-body sh-body" id="shBody"></div>`);
+  m.querySelector(".modal").classList.add("share-modal");
+  const body = $("#shBody", m);
+  const paint = () => { body.innerHTML = shareBodyHTML(n); };
+  paint();
+  const msg = () => `Oi! Te mandei ${n.kind === "moodboard" ? "o moodboard" : "a nota"} “${titleOf(n)}”:\n\n${shareUrl(n.share.id)}\n\nÉ só abrir o link — não precisa instalar nada.`;
+  m.addEventListener("change", async (e) => {
+    if (e.target.id !== "shOn") return;
+    const sw = e.target; sw.disabled = true; body.classList.add("busy");
+    try {
+      if (sw.checked) { await shareEnable(n); paint(); toast("Link criado"); setTimeout(() => $("#shUrl", m)?.select(), 60); }
+      else { await shareDisable(n); paint(); toast("Link desligado — quem tinha o link não consegue mais abrir"); }
+    } catch (err) { sw.checked = !sw.checked; toast(shareErrMsg(err)); }
+    finally { sw.disabled = false; body.classList.remove("busy"); }
+  });
+  m.addEventListener("submit", (e) => {
+    if (e.target.id !== "shMail") return; e.preventDefault();
+    const to = $("#shEmail", m).value.trim();
+    if (to && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) { $("#shEmail", m).classList.add("bad"); $("#shEmail", m).focus(); return; }
+    openExt(`mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(titleOf(n) + " · ForeverNote")}&body=${encodeURIComponent(msg())}`);
+  });
+  m.addEventListener("click", async (e) => {
+    if (e.target.closest("#shX")) return m.close();
+    const b = e.target.closest("[data-sh]"); if (!b) return;
+    const k = b.dataset.sh;
+    if (k === "login") { m.close(); loginModal(); return; }
+    if (k === "copy") { const inp = $("#shUrl", m); inp.select(); copyText(inp.value, "Link copiado"); return; }
+    if (k === "whats") { openExt("https://wa.me/?text=" + encodeURIComponent(msg())); return; }
+    if (k === "mail") { openExt(`mailto:?subject=${encodeURIComponent(titleOf(n) + " · ForeverNote")}&body=${encodeURIComponent(msg())}`); return; }
+    if (k === "more") { try { await navigator.share({ title: titleOf(n), text: `${titleOf(n)} · ForeverNote`, url: shareUrl(n.share.id) }); } catch (err) {} return; }
+    if (k === "open") { openExt(shareUrl(n.share.id)); return; }
+    if (k === "imgsave") { mbExport(n.id); return; }
+    if (k === "imgcopy") { mbCopyImage(n); return; }
+    if (k === "imgshare") { mbShareImage(n); return; }
+  });
+}
+
+/* ---------- dados do sistema sincronizados (modelos de moodboard, endereço da versão web) ---------- */
+function applySysRow(r) {
+  if (!r || !r.data || r.data.kind !== "sys" || (r.updated || 0) <= (S.prefs.sysUpd || 0)) return false;
+  const d = r.data;
+  S.prefs.boardTpls = Array.isArray(d.boardTpls) ? d.boardTpls : [];
+  if (d.webBase) S.prefs.webBase = d.webBase;
+  S.prefs.sysUpd = r.updated; savePrefs();
+  return true;
+}
+async function sysPush() {
+  S.prefs.sysUpd = Date.now(); savePrefs();
+  if (!SB || !CLOUD.user) return;
+  // deleted:true faz versões antigas do app ignorarem esta linha
+  try { await SB.from("notes").upsert({ id: SYS_ID, user_id: CLOUD.user.id, data: { kind: "sys", boardTpls: S.prefs.boardTpls || [], webBase: S.prefs.webBase || "" }, updated: S.prefs.sysUpd, deleted: true }, { onConflict: "user_id,id" }); } catch (e) {}
+}
 
 async function init() {
   const d = await api.load();
