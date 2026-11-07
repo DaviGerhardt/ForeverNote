@@ -1,0 +1,24 @@
+FOREVERNOTE - versao {VERSAO}
+by revmpt
+
+COMO INSTALAR
+1. Clique com o botao direito no arquivo .zip e escolha "Extrair tudo".
+2. Abra a pasta extraida e de dois cliques em "Instalar.bat".
+3. Se o Windows mostrar "O Windows protegeu o computador", clique em
+   "Mais informacoes" e depois em "Executar assim mesmo".
+   (Aparece porque o app e novo e nao tem assinatura digital paga.)
+4. O app abre sozinho e cria atalhos na Area de Trabalho e no Menu Iniciar.
+
+ONDE FICAM AS NOTAS
+Documentos\ForeverNote  (da para trocar em Configuracoes,
+por exemplo para uma pasta do Google Drive).
+Uma copia de seguranca e feita todo dia na subpasta "backups".
+Com a sincronizacao ligada (Configuracoes > Sincronizacao), tudo fica
+guardado na nuvem e aparece tambem no celular.
+
+ATUALIZACOES
+O app se atualiza sozinho: quando sai uma versao nova, aparece um aviso
+para atualizar. As notas continuam.
+
+VERSAO CELULAR
+https://davigerhardt.github.io/ForeverNote/

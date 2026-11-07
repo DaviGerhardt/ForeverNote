@@ -1,0 +1,3 @@
+*.bat -text
+release/LEIA-ME.txt -text
+release/*.ps1 -text

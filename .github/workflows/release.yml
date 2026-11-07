@@ -1,0 +1,54 @@
+name: Publicar versao para Windows
+
+on:
+  push:
+    branches: [main]
+    paths: ['app/**', 'release/**', '.github/workflows/release.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Montar o ForeverNote
+        shell: pwsh
+        run: ./release/build-release.ps1
+
+      - name: Publicar a versao (Releases)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ver = (Get-Content app/package.json -Raw | ConvertFrom-Json).version
+          $info = Get-Content latest.json -Raw | ConvertFrom-Json
+          $tag = "v$ver"
+          $zip = "out/ForeverNote-v$ver.zip"
+          $notes = @"
+          $($info.notes)
+
+          ### Como instalar no PC
+          1. Baixe o **ForeverNote-v$ver.zip** aqui embaixo, em *Assets*.
+          2. Clique com o botao direito > **Extrair tudo**.
+          3. Abra a pasta e de dois cliques em **Instalar.bat**.
+
+          Ja tem o app? Ele se atualiza sozinho.
+
+          **Versao celular:** https://davigerhardt.github.io/ForeverNote/
+
+          by revmpt
+          "@
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip --clobber
+          } else {
+            gh release create $tag $zip --title "ForeverNote $tag" --notes $notes --latest
+          }
