@@ -1,7 +1,7 @@
 {
   "name": "forevernote",
   "productName": "ForeverNote",
-  "version": "2.9.3",
+  "version": "2.9.4",
   "description": "Notas com cadernos, pilhas, etiquetas e lembretes.",
   "main": "main.js",
   "author": "ForeverNote",

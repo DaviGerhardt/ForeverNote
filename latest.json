@@ -1,4 +1,4 @@
 {
-  "version": "2.9.3",
-  "notes": "Redimensionar a foto pelo canto agora aumenta/diminui a foto inteira, sem cortar (Shift deixa livre; as laterais ajustam o recorte).\nCorrigido: a folha do moodboard podia ficar mudando de tamanho sem parar em alguns celulares.\nO editor do moodboard da nota fecha sozinho ao trocar de nota."
+  "version": "2.9.4",
+  "notes": "No PC, a primeira abertura agora mostra a tela de boas-vindas para entrar ou criar conta e ligar a sincronização com o celular (dá para usar sem conta)."
 }

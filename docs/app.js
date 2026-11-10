@@ -889,7 +889,7 @@ function welcomeScreen() {
   setTimeout(() => { const e = $("#wlE", w); if (e && !matchMedia("(max-width:640px)").matches) e.focus(); }, 450);
 }
 function maybeWelcome() {
-  if (!WEB || !SB || CLOUD.user) return;
+  if (!SB || CLOUD.user) return;
   let seen = true; try { seen = localStorage.getItem("fn-welcomed") === "1"; } catch (e) {}
   if (!seen) welcomeScreen();
 }

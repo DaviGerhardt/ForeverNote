@@ -1488,3 +1488,6 @@ html.mobile .mbs-top .mbs-back span,html.mobile .mbs-crumb>span:first-child,html
 .mb-sheet~.pop,.mb-sheet~.pop.sub{z-index:47}
 
 .mb-mini{isolation:isolate}
+
+/* PC: a tela de boas-vindas deixa a barra de título livre (mover, minimizar, fechar) */
+html:not(.web) .welcome{top:var(--tbh)}
