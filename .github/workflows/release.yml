@@ -23,6 +23,14 @@ jobs:
         shell: pwsh
         run: ./release/build-release.ps1
 
+      - name: Montar o instalador (.exe)
+        shell: pwsh
+        run: ./release/build-setup.ps1
+
+      - name: Testar o instalador (instalar, atualizar, desinstalar)
+        shell: pwsh
+        run: ./release/test-setup.ps1
+
       - name: Publicar a versao (Releases)
         shell: pwsh
         env:
@@ -32,15 +40,17 @@ jobs:
           $info = Get-Content latest.json -Raw | ConvertFrom-Json
           $tag = "v$ver"
           $zip = "out/ForeverNote-v$ver.zip"
+          $setup = "out/ForeverNote-Setup-v$ver.exe"
           $notes = @"
           $($info.notes)
 
           ### Como instalar no PC
-          1. Baixe o **ForeverNote-v$ver.zip** aqui embaixo, em *Assets*.
-          2. Clique com o botao direito > **Extrair tudo**.
-          3. Abra a pasta e de dois cliques em **Instalar.bat**.
+          Baixe o **ForeverNote-Setup-v$ver.exe** aqui embaixo, em *Assets*, e de dois cliques.
+          Se o Windows mostrar "O Windows protegeu o computador", clique em **Mais informacoes** > **Executar assim mesmo**.
 
-          Ja tem o app? Ele se atualiza sozinho.
+          Ja tem o app? Ele se atualiza sozinho. Suas notas nunca sao apagadas.
+
+          <sub>Prefere sem instalador? Use o ForeverNote-v$ver.zip (extraia e rode o Instalar.bat).</sub>
 
           **Versao celular:** https://davigerhardt.github.io/ForeverNote/
 
@@ -48,7 +58,7 @@ jobs:
           "@
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $zip --clobber
+            gh release upload $tag $setup $zip --clobber
           } else {
-            gh release create $tag $zip --title "ForeverNote $tag" --notes $notes --latest
+            gh release create $tag $setup $zip --title "ForeverNote $tag" --notes $notes --latest
           }

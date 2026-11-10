@@ -230,6 +230,18 @@ function buildContextMenu(p) {
   if (t.length) Menu.buildFromTemplate(t).popup({ window: win });
 }
 
+/* instalador (.exe): mantém a versão certa em Configurações > Aplicativos depois das atualizações automáticas */
+function syncUninstallVersion() {
+  if (process.platform !== "win32" || !app.isPackaged) return;
+  const key = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{8E3A5C2B-6F1D-4B7A-9C3E-2D5F7A1B9C40}_is1";
+  const cp = require("child_process"), v = app.getVersion();
+  cp.execFile("reg.exe", ["query", key, "/v", "DisplayVersion"], { windowsHide: true }, (err, out) => {
+    if (err || !out) return;
+    const m = /DisplayVersion\s+REG_SZ\s+(\S+)/.exec(out);
+    if (m && m[1] !== v) cp.execFile("reg.exe", ["add", key, "/v", "DisplayVersion", "/t", "REG_SZ", "/d", v, "/f"], { windowsHide: true }, () => {});
+  });
+}
+
 function createShortcuts() {
   if (process.platform !== "win32" || !app.isPackaged) return;
   const startLnk = path.join(app.getPath("appData"), "Microsoft", "Windows", "Start Menu", "Programs", "ForeverNote.lnk");
@@ -809,6 +821,7 @@ app.whenReady().then(() => {
   dailyBackup();
   createWindow();
   createShortcuts();
+  syncUninstallVersion();
   createTray();
   try { globalShortcut.register("CommandOrControl+Alt+N", () => (quick && quick.isVisible() ? quick.focus() : showQuick())); } catch (e) {}
   if (process.argv.includes("--bandeja") && tray) win.once("ready-to-show", () => setTimeout(() => win.hide(), 50));

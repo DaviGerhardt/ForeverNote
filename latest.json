@@ -1,4 +1,4 @@
 {
-  "version": "2.9.4",
-  "notes": "No PC, a primeira abertura agora mostra a tela de boas-vindas para entrar ou criar conta e ligar a sincronização com o celular (dá para usar sem conta)."
+  "version": "2.9.5",
+  "notes": "Novo instalador para Windows (.exe): baixe, dê dois cliques e pronto. Cria os atalhos e aparece em Configurações > Aplicativos, de onde também dá para desinstalar (suas notas nunca são apagadas)."
 }
